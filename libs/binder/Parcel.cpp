@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/sched.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,7 +41,6 @@
 #include <binder/TextOutput.h>
 
 #include <cutils/ashmem.h>
-#include <utils/Debug.h>
 #include <utils/Flattenable.h>
 #include <utils/Log.h>
 #include <utils/misc.h>
@@ -188,16 +188,18 @@ status_t Parcel::finishUnflattenBinder(
     return OK;
 }
 
+static constexpr inline int schedPolicyMask(int policy, int priority) {
+    return (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT);
+}
+
 status_t Parcel::flattenBinder(const sp<IBinder>& binder)
 {
     flat_binder_object obj;
+    obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
-    if (IPCThreadState::self()->backgroundSchedulingDisabled()) {
-        /* minimum priority for all nodes is nice 0 */
-        obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
-    } else {
-        /* minimum priority for all nodes is MAX_NICE(19) */
-        obj.flags = 0x13 | FLAT_BINDER_FLAG_ACCEPTS_FDS;
+    int schedBits = 0;
+    if (!IPCThreadState::self()->backgroundSchedulingDisabled()) {
+        schedBits = schedPolicyMask(SCHED_NORMAL, 19);
     }
 
     if (binder != nullptr) {
@@ -213,6 +215,13 @@ status_t Parcel::flattenBinder(const sp<IBinder>& binder)
             obj.handle = handle;
             obj.cookie = 0;
         } else {
+            int policy = local->getMinSchedulerPolicy();
+            int priority = local->getMinSchedulerPriority();
+
+            if (policy != 0 || priority != 0) {
+                // override value, since it is set explicitly
+                schedBits = schedPolicyMask(policy, priority);
+            }
             if (local->isRequestingSid()) {
                 obj.flags |= FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
             }
@@ -225,6 +234,8 @@ status_t Parcel::flattenBinder(const sp<IBinder>& binder)
         obj.binder = 0;
         obj.cookie = 0;
     }
+
+    obj.flags |= schedBits;
 
     return finishFlattenBinder(binder, obj);
 }
@@ -422,8 +433,10 @@ status_t Parcel::appendFrom(const Parcel *parcel, size_t offset, size_t len)
         const sp<ProcessState> proc(ProcessState::self());
         // grow objects
         if (mObjectsCapacity < mObjectsSize + numObjects) {
+            if ((size_t) numObjects > SIZE_MAX - mObjectsSize) return NO_MEMORY; // overflow
+            if (mObjectsSize + numObjects > SIZE_MAX / 3) return NO_MEMORY; // overflow
             size_t newSize = ((mObjectsSize + numObjects)*3)/2;
-            if (newSize*sizeof(binder_size_t) < mObjectsSize) return NO_MEMORY;   // overflow
+            if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
             binder_size_t *objects =
                 (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
             if (objects == (binder_size_t*)nullptr) {
@@ -1373,8 +1386,10 @@ restart_write:
         if (err != NO_ERROR) return err;
     }
     if (!enoughObjects) {
+        if (mObjectsSize > SIZE_MAX - 2) return NO_MEMORY; // overflow
+        if ((mObjectsSize + 2) > SIZE_MAX / 3) return NO_MEMORY; // overflow
         size_t newSize = ((mObjectsSize+2)*3)/2;
-        if (newSize*sizeof(binder_size_t) < mObjectsSize) return NO_MEMORY;   // overflow
+        if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
         binder_size_t* objects = (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
         if (objects == nullptr) return NO_MEMORY;
         mObjects = objects;
@@ -1500,7 +1515,7 @@ const void* Parcel::readInplace(size_t len) const
 
 template<class T>
 status_t Parcel::readAligned(T *pArg) const {
-    COMPILE_TIME_ASSERT_FUNCTION_SCOPE(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
+    static_assert(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
 
     if ((mDataPos+sizeof(T)) <= mDataSize) {
         if (mObjectsSize > 0) {
@@ -1533,7 +1548,7 @@ T Parcel::readAligned() const {
 
 template<class T>
 status_t Parcel::writeAligned(T val) {
-    COMPILE_TIME_ASSERT_FUNCTION_SCOPE(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
+    static_assert(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
 
     if ((mDataPos+sizeof(val)) <= mDataCapacity) {
 restart_write:
@@ -2606,6 +2621,8 @@ status_t Parcel::growData(size_t len)
         return BAD_VALUE;
     }
 
+    if (len > SIZE_MAX - mDataSize) return NO_MEMORY; // overflow
+    if (mDataSize + len > SIZE_MAX / 3) return NO_MEMORY; // overflow
     size_t newSize = ((mDataSize+len)*3)/2;
     return (newSize <= mDataSize)
             ? (status_t) NO_MEMORY

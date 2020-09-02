@@ -17,6 +17,8 @@ cc_library_headers {
     export_include_dirs: ["include"],
     vendor_available: true,
     host_supported: true,
+    // TODO(b/153609531): remove when no longer needed.
+    native_bridge_supported: true,
 
     header_libs: [
         "libbase_headers",
@@ -62,6 +64,8 @@ cc_library {
     },
     double_loadable: true,
     host_supported: true,
+    // TODO(b/153609531): remove when no longer needed.
+    native_bridge_supported: true,
 
     // TODO(b/31559095): get headers from bionic on host
     include_dirs: [
@@ -74,7 +78,7 @@ cc_library {
     // or dessert updates. Instead, apex users should use libbinder_ndk.
     apex_available: [
         "//apex_available:platform",
-        // TODO(b/139016109) remove these three
+        // TODO(b/166468760) remove these three
         "com.android.media.swcodec",
         "test_com.android.media.swcodec",
     ],
@@ -122,6 +126,10 @@ cc_library {
     aidl: {
         export_aidl_headers: true,
     },
+
+    // TODO(b/142684679): for com.android.media which is compiled
+    // as vendor and used as system code.
+    use_apex_name_macro: true,
 
     cflags: [
         "-Wall",
