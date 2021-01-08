@@ -21,7 +21,8 @@ use crate::parcel::Parcel;
 use crate::proxy::{DeathRecipient, SpIBinder};
 use crate::sys;
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
+use std::os::raw::c_char;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
@@ -33,8 +34,7 @@ pub type TransactionCode = u32;
 
 /// Additional operation flags.
 ///
-/// Can be either 0 for a normal RPC, or [`IBinder::FLAG_ONEWAY`] for a
-/// one-way RPC.
+/// `IBinder::FLAG_*` values.
 pub type TransactionFlags = u32;
 
 /// Super-trait for Binder interfaces.
@@ -91,12 +91,17 @@ pub trait IBinder {
 
     /// Corresponds to TF_ONE_WAY -- an asynchronous call.
     const FLAG_ONEWAY: TransactionFlags = sys::FLAG_ONEWAY;
+    /// Corresponds to TF_CLEAR_BUF -- clear transaction buffers after call is made.
+    const FLAG_CLEAR_BUF: TransactionFlags = sys::FLAG_CLEAR_BUF;
 
     /// Is this object still alive?
     fn is_binder_alive(&self) -> bool;
 
     /// Send a ping transaction to this object
     fn ping_binder(&mut self) -> Result<()>;
+
+    /// Indicate that the service intends to receive caller security contexts.
+    fn set_requesting_sid(&mut self, enable: bool);
 
     /// Dump this object to the given file handle
     fn dump<F: AsRawFd>(&mut self, fp: &F, args: &[&str]) -> Result<()>;
@@ -200,6 +205,22 @@ impl InterfaceClass {
     /// `AIBinder_Class`.
     pub(crate) unsafe fn from_ptr(ptr: *const sys::AIBinder_Class) -> InterfaceClass {
         InterfaceClass(ptr)
+    }
+
+    /// Get the interface descriptor string of this class.
+    pub fn get_descriptor(&self) -> String {
+        unsafe {
+            // SAFETY: The descriptor returned by AIBinder_Class_getDescriptor
+            // is always a two-byte null terminated sequence of u16s. Thus, we
+            // can continue reading from the pointer until we hit a null value,
+            // and this pointer can be a valid slice if the slice length is <=
+            // the number of u16 elements before the null terminator.
+
+            let raw_descriptor: *const c_char = sys::AIBinder_Class_getDescriptor(self.0);
+            CStr::from_ptr(raw_descriptor).to_str()
+                .expect("Expected valid UTF-8 string from AIBinder_Class_getDescriptor")
+                .into()
+        }
     }
 }
 
@@ -503,12 +524,7 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(mut binder: $crate::SpIBinder) -> $crate::Result<Self> {
-                use $crate::AssociateClass;
-                if binder.associate_class(<$native as $crate::Remotable>::get_class()) {
-                    Ok(Self { binder, $($fname: $finit),* })
-                } else {
-                    Err($crate::StatusCode::BAD_TYPE)
-                }
+                Ok(Self { binder, $($fname: $finit),* })
             }
         }
 
@@ -529,7 +545,17 @@ macro_rules! declare_binder_interface {
             }
 
             fn on_transact(&self, code: $crate::TransactionCode, data: &$crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
-                $on_transact(&*self.0, code, data, reply)
+                match $on_transact(&*self.0, code, data, reply) {
+                    // The C++ backend converts UNEXPECTED_NULL into an exception
+                    Err($crate::StatusCode::UNEXPECTED_NULL) => {
+                        let status = $crate::Status::new_exception(
+                            $crate::ExceptionCode::NULL_POINTER,
+                            None,
+                        );
+                        reply.write(&status)
+                    },
+                    result => result
+                }
             }
 
             fn get_class() -> $crate::InterfaceClass {
@@ -553,16 +579,35 @@ macro_rules! declare_binder_interface {
         impl $crate::FromIBinder for dyn $interface {
             fn try_from(mut ibinder: $crate::SpIBinder) -> $crate::Result<Box<dyn $interface>> {
                 use $crate::AssociateClass;
-                if !ibinder.associate_class(<$native as $crate::Remotable>::get_class()) {
-                    return Err($crate::StatusCode::BAD_TYPE.into());
+
+                let existing_class = ibinder.get_class();
+                if let Some(class) = existing_class {
+                    if class != <$native as $crate::Remotable>::get_class() &&
+                        class.get_descriptor() == <$native as $crate::Remotable>::get_descriptor()
+                    {
+                        // The binder object's descriptor string matches what we
+                        // expect. We still need to treat this local or already
+                        // associated object as remote, because we can't cast it
+                        // into a Rust service object without a matching class
+                        // pointer.
+                        return Ok(Box::new(<$proxy as $crate::Proxy>::from_binder(ibinder)?));
+                    }
                 }
 
-                let service: $crate::Result<$crate::Binder<$native>> = std::convert::TryFrom::try_from(ibinder.clone());
-                if let Ok(service) = service {
-                    Ok(Box::new(service))
-                } else {
-                    Ok(Box::new(<$proxy as $crate::Proxy>::from_binder(ibinder)?))
+                if ibinder.associate_class(<$native as $crate::Remotable>::get_class()) {
+                    let service: $crate::Result<$crate::Binder<$native>> =
+                        std::convert::TryFrom::try_from(ibinder.clone());
+                    if let Ok(service) = service {
+                        // We were able to associate with our expected class and
+                        // the service is local.
+                        return Ok(Box::new(service));
+                    } else {
+                        // Service is remote
+                        return Ok(Box::new(<$proxy as $crate::Proxy>::from_binder(ibinder)?));
+                    }
                 }
+
+                Err($crate::StatusCode::BAD_TYPE.into())
             }
         }
 
@@ -579,6 +624,66 @@ macro_rules! declare_binder_interface {
         impl $crate::parcel::SerializeOption for dyn $interface + '_ {
             fn serialize_option(this: Option<&Self>, parcel: &mut $crate::parcel::Parcel) -> $crate::Result<()> {
                 parcel.write(&this.map($crate::Interface::as_binder))
+            }
+        }
+
+        impl std::fmt::Debug for dyn $interface {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.pad(stringify!($interface))
+            }
+        }
+
+        // Convert a &dyn $interface to Box<dyn $interface>
+        impl std::borrow::ToOwned for dyn $interface {
+            type Owned = Box<dyn $interface>;
+            fn to_owned(&self) -> Self::Owned {
+                self.as_binder().into_interface()
+                    .expect(concat!("Error cloning interface ", stringify!($interface)))
+            }
+        }
+    };
+}
+
+/// Declare an AIDL enumeration.
+///
+/// This is mainly used internally by the AIDL compiler.
+#[macro_export]
+macro_rules! declare_binder_enum {
+    {
+        $enum:ident : $backing:ty {
+            $( $name:ident = $value:expr, )*
+        }
+    } => {
+        #[derive(Debug, Default, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
+        pub struct $enum(pub $backing);
+        impl $enum {
+            $( pub const $name: Self = Self($value); )*
+        }
+
+        impl $crate::parcel::Serialize for $enum {
+            fn serialize(&self, parcel: &mut $crate::parcel::Parcel) -> $crate::Result<()> {
+                parcel.write(&self.0)
+            }
+        }
+
+        impl $crate::parcel::SerializeArray for $enum {
+            fn serialize_array(slice: &[Self], parcel: &mut $crate::parcel::Parcel) -> $crate::Result<()> {
+                let v: Vec<$backing> = slice.iter().map(|x| x.0).collect();
+                <$backing as binder::parcel::SerializeArray>::serialize_array(&v[..], parcel)
+            }
+        }
+
+        impl $crate::parcel::Deserialize for $enum {
+            fn deserialize(parcel: &$crate::parcel::Parcel) -> $crate::Result<Self> {
+                parcel.read().map(Self)
+            }
+        }
+
+        impl $crate::parcel::DeserializeArray for $enum {
+            fn deserialize_array(parcel: &$crate::parcel::Parcel) -> $crate::Result<Option<Vec<Self>>> {
+                let v: Option<Vec<$backing>> =
+                    <$backing as binder::parcel::DeserializeArray>::deserialize_array(parcel)?;
+                Ok(v.map(|v| v.into_iter().map(Self).collect()))
             }
         }
     };

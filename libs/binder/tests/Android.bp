@@ -27,7 +27,9 @@ cc_test {
     defaults: ["binder_test_defaults"],
     srcs: ["binderDriverInterfaceTest.cpp"],
     compile_multilib: "32",
+    multilib: { lib32: { suffix: "" } },
     cflags: ["-DBINDER_IPC_32BIT=1"],
+    test_suites: ["vts"],
 }
 
 cc_test {
@@ -52,7 +54,27 @@ cc_test {
         "libutils",
     ],
     compile_multilib: "32",
+    multilib: { lib32: { suffix: "" } },
     cflags: ["-DBINDER_IPC_32BIT=1"],
+    test_suites: ["vts"],
+    require_root: true,
+}
+
+// unit test only, which can run on host and doesn't use /dev/binder
+cc_test {
+    name: "binderParcelTest",
+    host_supported: true,
+    target: {
+        darwin: {
+            enabled: false,
+        },
+    },
+    srcs: ["binderParcelTest.cpp"],
+    shared_libs: [
+        "libbinder",
+        "libutils",
+    ],
+    test_suites: ["general-tests"],
 }
 
 cc_test {

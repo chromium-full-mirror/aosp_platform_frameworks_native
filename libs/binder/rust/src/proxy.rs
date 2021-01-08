@@ -28,6 +28,7 @@ use crate::sys;
 
 use std::convert::TryInto;
 use std::ffi::{c_void, CString};
+use std::fmt;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
@@ -36,6 +37,12 @@ use std::ptr;
 /// This struct encapsulates the generic C++ `sp<IBinder>` class. This wrapper
 /// is untyped; typed interface access is implemented by the AIDL compiler.
 pub struct SpIBinder(*mut sys::AIBinder);
+
+impl fmt::Debug for SpIBinder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("SpIBinder")
+    }
+}
 
 /// # Safety
 ///
@@ -84,7 +91,7 @@ impl SpIBinder {
 
     /// Return the interface class of this binder object, if associated with
     /// one.
-    pub(crate) fn get_class(&mut self) -> Option<InterfaceClass> {
+    pub fn get_class(&mut self) -> Option<InterfaceClass> {
         unsafe {
             // Safety: `SpIBinder` guarantees that it always contains a valid
             // `AIBinder` pointer. `AIBinder_getClass` returns either a null
@@ -94,6 +101,11 @@ impl SpIBinder {
             let class = sys::AIBinder_getClass(self.as_native_mut());
             class.as_ref().map(|p| InterfaceClass::from_ptr(p))
         }
+    }
+
+    /// Creates a new weak reference to this binder object.
+    pub fn downgrade(&mut self) -> WpIBinder {
+        WpIBinder::new(self)
     }
 }
 
@@ -242,6 +254,12 @@ impl<T: AsNative<sys::AIBinder>> IBinder for T {
         status_result(status)
     }
 
+    fn set_requesting_sid(&mut self, enable: bool) {
+        unsafe {
+            sys::AIBinder_setRequestingSid(self.as_native_mut(), enable)
+        };
+    }
+
     fn dump<F: AsRawFd>(&mut self, fp: &F, args: &[&str]) -> Result<()> {
         let args: Vec<_> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
         let mut arg_ptrs: Vec<_> = args.iter().map(|a| a.as_ptr()).collect();
@@ -339,7 +357,10 @@ impl SerializeArray for Option<&SpIBinder> {}
 
 impl Deserialize for SpIBinder {
     fn deserialize(parcel: &Parcel) -> Result<SpIBinder> {
-        parcel.read_binder().transpose().unwrap()
+        parcel
+            .read_binder()
+            .transpose()
+            .unwrap_or(Err(StatusCode::UNEXPECTED_NULL))
     }
 }
 
@@ -354,15 +375,25 @@ impl DeserializeArray for Option<SpIBinder> {}
 
 /// A weak reference to a Binder remote object.
 ///
-/// This struct encapsulates the C++ `wp<IBinder>` class. However, this wrapper
-/// is untyped, so properly typed versions implementing a particular binder
-/// interface should be crated with [`declare_binder_interface!`].
+/// This struct encapsulates the generic C++ `wp<IBinder>` class. This wrapper
+/// is untyped; typed interface access is implemented by the AIDL compiler.
 pub struct WpIBinder(*mut sys::AIBinder_Weak);
+
+impl fmt::Debug for WpIBinder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("WpIBinder")
+    }
+}
+
+/// # Safety
+///
+/// A `WpIBinder` is a handle to a C++ IBinder, which is thread-safe.
+unsafe impl Send for WpIBinder {}
 
 impl WpIBinder {
     /// Create a new weak reference from an object that can be converted into a
     /// raw `AIBinder` pointer.
-    pub fn new<B: AsNative<sys::AIBinder>>(binder: &mut B) -> WpIBinder {
+    fn new<B: AsNative<sys::AIBinder>>(binder: &mut B) -> WpIBinder {
         let ptr = unsafe {
             // Safety: `SpIBinder` guarantees that `binder` always contains a
             // valid pointer to an `AIBinder`.
@@ -381,6 +412,16 @@ impl WpIBinder {
             // to pass to `SpIBinder::from_raw`.
             let ptr = sys::AIBinder_Weak_promote(self.0);
             SpIBinder::from_raw(ptr)
+        }
+    }
+}
+
+impl Drop for WpIBinder {
+    fn drop(&mut self) {
+        unsafe {
+            // Safety: WpIBinder always holds a valid `AIBinder_Weak` pointer, so we
+            // know this pointer is safe to pass to `AIBinder_Weak_delete` here.
+            sys::AIBinder_Weak_delete(self.0);
         }
     }
 }

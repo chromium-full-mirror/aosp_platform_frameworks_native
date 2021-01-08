@@ -16,6 +16,13 @@
       "name": "binderTextOutputTest"
     },
     {
+      "name": "binderParcelTest"
+    },
+    {
+      "name": "binderParcelTest",
+      "host": true
+    },
+    {
       "name": "binderLibTest"
     },
     {
@@ -31,6 +38,9 @@
       "name": "aidl_lazy_test"
     },
     {
+      "name": "aidl_integration_test"
+    },
+    {
       "name": "libbinderthreadstateutils_test"
     },
     {
@@ -43,6 +53,15 @@
           "exclude-filter": "android.os.cts.StrictModeTest#testNonSdkApiUsage"
         }
       ]
+    },
+    {
+      "name": "libbinder_rs-internal_test"
+    },
+    {
+      "name": "rustBinderTest"
+    },
+    {
+      "name": "binderRustNdkInteropTest"
     }
   ]
 }

@@ -18,7 +18,8 @@
 
 use binder::declare_binder_interface;
 use binder::parcel::Parcel;
-use binder::{Binder, IBinder, Interface, SpIBinder, TransactionCode};
+use binder::{Binder, IBinder, Interface, SpIBinder, StatusCode, ThreadState, TransactionCode};
+use std::convert::{TryFrom, TryInto};
 
 /// Name of service runner.
 ///
@@ -49,6 +50,7 @@ fn main() -> Result<(), &'static str> {
         let mut service = Binder::new(BnTest(Box::new(TestService {
             s: service_name.clone(),
         })));
+        service.set_requesting_sid(true);
         if let Some(extension_name) = extension_name {
             let extension = BnTest::new_binder(TestService { s: extension_name });
             service
@@ -79,11 +81,37 @@ struct TestService {
     s: String,
 }
 
+#[repr(u32)]
+enum TestTransactionCode {
+    Test = SpIBinder::FIRST_CALL_TRANSACTION,
+    GetSelinuxContext,
+}
+
+impl TryFrom<u32> for TestTransactionCode {
+    type Error = StatusCode;
+
+    fn try_from(c: u32) -> Result<Self, Self::Error> {
+        match c {
+            _ if c == TestTransactionCode::Test as u32 => Ok(TestTransactionCode::Test),
+            _ if c == TestTransactionCode::GetSelinuxContext as u32 => {
+                Ok(TestTransactionCode::GetSelinuxContext)
+            }
+            _ => Err(StatusCode::UNKNOWN_TRANSACTION),
+        }
+    }
+}
+
 impl Interface for TestService {}
 
 impl ITest for TestService {
     fn test(&self) -> binder::Result<String> {
         Ok(self.s.clone())
+    }
+
+    fn get_selinux_context(&self) -> binder::Result<String> {
+        let sid =
+            ThreadState::with_calling_sid(|sid| sid.map(|s| s.to_string_lossy().into_owned()));
+        sid.ok_or(StatusCode::UNEXPECTED_NULL)
     }
 }
 
@@ -91,6 +119,9 @@ impl ITest for TestService {
 pub trait ITest: Interface {
     /// Returns a test string
     fn test(&self) -> binder::Result<String>;
+
+    /// Returns the caller's SELinux context
+    fn get_selinux_context(&self) -> binder::Result<String>;
 }
 
 declare_binder_interface! {
@@ -104,19 +135,30 @@ declare_binder_interface! {
 
 fn on_transact(
     service: &dyn ITest,
-    _code: TransactionCode,
+    code: TransactionCode,
     _data: &Parcel,
     reply: &mut Parcel,
 ) -> binder::Result<()> {
-    reply.write(&service.test()?)?;
-    Ok(())
+    match code.try_into()? {
+        TestTransactionCode::Test => reply.write(&service.test()?),
+        TestTransactionCode::GetSelinuxContext => reply.write(&service.get_selinux_context()?),
+    }
 }
 
 impl ITest for BpTest {
     fn test(&self) -> binder::Result<String> {
-        let reply = self
-            .binder
-            .transact(SpIBinder::FIRST_CALL_TRANSACTION, 0, |_| Ok(()))?;
+        let reply =
+            self.binder
+                .transact(TestTransactionCode::Test as TransactionCode, 0, |_| Ok(()))?;
+        reply.read()
+    }
+
+    fn get_selinux_context(&self) -> binder::Result<String> {
+        let reply = self.binder.transact(
+            TestTransactionCode::GetSelinuxContext as TransactionCode,
+            0,
+            |_| Ok(()),
+        )?;
         reply.read()
     }
 }
@@ -125,20 +167,51 @@ impl ITest for Binder<BnTest> {
     fn test(&self) -> binder::Result<String> {
         self.0.test()
     }
+
+    fn get_selinux_context(&self) -> binder::Result<String> {
+        self.0.get_selinux_context()
+    }
 }
+
+/// Trivial testing binder interface
+pub trait ITestSameDescriptor: Interface {}
+
+declare_binder_interface! {
+    ITestSameDescriptor["android.os.ITest"] {
+        native: BnTestSameDescriptor(on_transact_same_descriptor),
+        proxy: BpTestSameDescriptor,
+    }
+}
+
+fn on_transact_same_descriptor(
+    _service: &dyn ITestSameDescriptor,
+    _code: TransactionCode,
+    _data: &Parcel,
+    _reply: &mut Parcel,
+) -> binder::Result<()> {
+    Ok(())
+}
+
+impl ITestSameDescriptor for BpTestSameDescriptor {}
+
+impl ITestSameDescriptor for Binder<BnTestSameDescriptor> {}
+
 
 #[cfg(test)]
 mod tests {
+    use selinux_bindgen as selinux_sys;
+    use std::ffi::CStr;
     use std::fs::File;
     use std::process::{Child, Command};
+    use std::ptr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
-    use binder::{DeathRecipient, FromIBinder, IBinder, SpIBinder, StatusCode};
+    use binder::{Binder, DeathRecipient, FromIBinder, IBinder, Interface, SpIBinder, StatusCode};
 
-    use super::{ITest, RUST_SERVICE_BINARY};
+    use super::{BnTest, ITest, ITestSameDescriptor, RUST_SERVICE_BINARY, TestService};
 
     pub struct ScopedServiceProcess(Child);
 
@@ -201,6 +274,24 @@ mod tests {
         let test_client: Box<dyn ITest> =
             binder::get_interface(service_name).expect("Did not get manager binder service");
         assert_eq!(test_client.test().unwrap(), "trivial_client_test");
+    }
+
+    #[test]
+    fn get_selinux_context() {
+        let service_name = "get_selinux_context";
+        let _process = ScopedServiceProcess::new(service_name);
+        let test_client: Box<dyn ITest> =
+            binder::get_interface(service_name).expect("Did not get manager binder service");
+        let expected_context = unsafe {
+            let mut out_ptr = ptr::null_mut();
+            assert_eq!(selinux_sys::getcon(&mut out_ptr), 0);
+            assert!(!out_ptr.is_null());
+            CStr::from_ptr(out_ptr)
+        };
+        assert_eq!(
+            test_client.get_selinux_context().unwrap(),
+            expected_context.to_str().expect("context was invalid UTF-8"),
+        );
     }
 
     fn register_death_notification(binder: &mut SpIBinder) -> (Arc<AtomicBool>, DeathRecipient) {
@@ -367,5 +458,41 @@ mod tests {
 
             assert_eq!(extension.test().unwrap(), extension_name);
         }
+    }
+
+    /// Test re-associating a local binder object with a different class.
+    ///
+    /// This is needed because different binder service (e.g. NDK vs Rust)
+    /// implementations are incompatible and must not be interchanged. A local
+    /// service with the same descriptor string but a different class pointer
+    /// may have been created by an NDK service and is therefore incompatible
+    /// with the Rust service implementation. It must be treated as remote and
+    /// all API calls parceled and sent through transactions.
+    ///
+    /// Further tests of this behavior with the C NDK and Rust API are in
+    /// rust_ndk_interop.rs
+    #[test]
+    fn associate_existing_class() {
+        let service = Binder::new(BnTest(Box::new(TestService {
+            s: "testing_service".to_string(),
+        })));
+
+        // This should succeed although we will have to treat the service as
+        // remote.
+        let _interface: Box<dyn ITestSameDescriptor> = FromIBinder::try_from(service.as_binder())
+            .expect("Could not re-interpret service as the ITestSameDescriptor interface");
+    }
+
+    /// Test that we can round-trip a rust service through a generic IBinder
+    #[test]
+    fn reassociate_rust_binder() {
+        let service_name = "testing_service";
+        let service_ibinder = BnTest::new_binder(TestService { s: service_name.to_string() })
+            .as_binder();
+
+        let service: Box<dyn ITest> = service_ibinder.into_interface()
+            .expect("Could not reassociate the generic ibinder");
+
+        assert_eq!(service.test().unwrap(), service_name);
     }
 }

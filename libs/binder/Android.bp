@@ -31,6 +31,11 @@ cc_library_headers {
         "libutils_headers",
     ],
     min_sdk_version: "29",
+    target: {
+        darwin: {
+            enabled: false,
+        },
+    },
 }
 
 // These interfaces are android-specific implementation unrelated to binder
@@ -99,6 +104,7 @@ cc_library {
         "MemoryDealer.cpp",
         "MemoryHeapBase.cpp",
         "Parcel.cpp",
+        "ParcelableHolder.cpp",
         "ParcelFileDescriptor.cpp",
         "PersistableBundle.cpp",
         "ProcessState.cpp",
@@ -106,6 +112,7 @@ cc_library {
         "Stability.cpp",
         "Status.cpp",
         "TextOutput.cpp",
+        "Utils.cpp",
         ":libbinder_aidl",
     ],
 
@@ -121,6 +128,9 @@ cc_library {
         vendor: {
             exclude_srcs: libbinder_device_interface_sources,
         },
+        darwin: {
+            enabled: false,
+        },
     },
 
     aidl: {
@@ -134,8 +144,10 @@ cc_library {
     cflags: [
         "-Wall",
         "-Wextra",
+        "-Wextra-semi",
         "-Werror",
         "-Wzero-as-null-pointer-constant",
+        "-DANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION",
     ],
     product_variables: {
         binder32bit: {
@@ -162,13 +174,32 @@ cc_library {
         misc_undefined: ["integer"],
     },
     min_sdk_version: "29",
+
+    tidy: true,
+    tidy_flags: [
+        // Only check our headers
+        "--header-filter=^.*frameworks/native/libs/binder/.*.h$",
+    ],
+    tidy_checks_as_errors: [
+        "*",
+        "-clang-analyzer-core.CallAndMessage",
+        "-clang-analyzer-core.uninitialized.Assign",
+        "-clang-analyzer-unix.Malloc,",
+        "-clang-analyzer-deadcode.DeadStores",
+        "-clang-analyzer-optin.cplusplus.UninitializedObject",
+        "-misc-no-recursion",
+        "-misc-redundant-expression",
+        "-misc-unused-using-decls",
+    ],
 }
 
 // AIDL interface between libbinder and framework.jar
 filegroup {
     name: "libbinder_aidl",
     srcs: [
+        "aidl/android/content/pm/IPackageChangeObserver.aidl",
         "aidl/android/content/pm/IPackageManagerNative.aidl",
+        "aidl/android/content/pm/PackageChangeEvent.aidl",
         "aidl/android/os/IClientCallback.aidl",
         "aidl/android/os/IServiceCallback.aidl",
         "aidl/android/os/IServiceManager.aidl",
