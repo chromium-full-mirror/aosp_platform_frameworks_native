@@ -59,7 +59,8 @@ void Lshal::forEachCommand(const std::function<void(const Command* c)>& f) const
 }
 
 void Lshal::usage() {
-    err() << "lshal: List and debug HALs." << std::endl << std::endl
+    err() << "lshal: List and debug HIDL HALs." << std::endl
+          << "   (for AIDL HALs, see `dumpsys`)" << std::endl << std::endl
           << "commands:" << std::endl;
 
     size_t nameMaxLength = 0;
@@ -141,12 +142,10 @@ Status Lshal::emitDebugInfo(
         }
     }
 
-    PipeRelay relay(out, err, interfaceName, instanceName);
-
-    if (relay.initCheck() != OK) {
-        std::string msg = "PipeRelay::initCheck() FAILED w/ " + std::to_string(relay.initCheck());
-        err << msg << std::endl;
-        LOG(ERROR) << msg;
+    auto relay = PipeRelay::create(out, err, interfaceName + "/" + instanceName);
+    if (!relay.ok()) {
+        err << "Unable to create PipeRelay: " << relay.error() << std::endl;
+        LOG(ERROR) << "Unable to create PipeRelay: " << relay.error();
         return IO_ERROR;
     }
 
@@ -154,7 +153,7 @@ Status Lshal::emitDebugInfo(
         native_handle_create(1 /* numFds */, 0 /* numInts */),
         native_handle_delete);
 
-    fdHandle->data[0] = relay.fd();
+    fdHandle->data[0] = relay.value()->fd().get();
 
     hardware::Return<void> ret = base->debug(fdHandle.get(), convert(options));
 

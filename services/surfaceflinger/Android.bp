@@ -1,3 +1,12 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "frameworks_native_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["frameworks_native_license"],
+}
+
 cc_defaults {
     name: "surfaceflinger_defaults",
     cflags: [
@@ -20,7 +29,6 @@ cc_defaults {
         "-DEGL_EGLEXT_PROTOTYPES",
     ],
     shared_libs: [
-        "android.frameworks.vr.composer@2.0",
         "android.hardware.configstore-utils",
         "android.hardware.configstore@1.0",
         "android.hardware.configstore@1.1",
@@ -33,7 +41,7 @@ cc_defaults {
         "android.hardware.graphics.composer@2.4",
         "android.hardware.power@1.0",
         "android.hardware.power@1.3",
-        "android.hardware.power-cpp",
+        "android.hardware.power-V1-cpp",
         "libbase",
         "libbinder",
         "libbufferhubqueue",
@@ -58,21 +66,12 @@ cc_defaults {
         "libutils",
         "libSurfaceFlingerProp",
     ],
-    // VrComposer is not used when building surfaceflinger for vendors
-    target: {
-        vendor: {
-            exclude_shared_libs: [
-                "android.frameworks.vr.composer@2.0",
-            ],
-        },
-    },
     static_libs: [
         "libcompositionengine",
         "libperfetto_client_experimental",
         "librenderengine",
         "libserviceutils",
         "libtrace_proto",
-        "libvrflinger",
     ],
     header_libs: [
         "android.hardware.graphics.composer@2.1-command-buffer",
@@ -113,6 +112,10 @@ cc_defaults {
         thin: true,
     },
     whole_program_vtables: true, // Requires ThinLTO
+    pgo: {
+        sampling: true,
+        profile_file: "surfaceflinger/surfaceflinger.profdata",
+    },
     // TODO(b/131771163): Fix broken fuzzer support with LTO.
     sanitize: {
         fuzzer: false,
@@ -141,6 +144,7 @@ filegroup {
         "DisplayHardware/ComposerHal.cpp",
         "DisplayHardware/DisplayIdentification.cpp",
         "DisplayHardware/FramebufferSurface.cpp",
+        "DisplayHardware/Hash.cpp",
         "DisplayHardware/HWC2.cpp",
         "DisplayHardware/HWComposer.cpp",
         "DisplayHardware/PowerAdvisor.cpp",
@@ -198,17 +202,6 @@ cc_library_shared {
         // can be easily replaced.
         "SurfaceFlingerFactory.cpp",
     ],
-    cflags: [
-        "-DUSE_VR_COMPOSER=1",
-    ],
-    // VrComposer is not used when building surfaceflinger for vendors
-    target: {
-        vendor: {
-            cflags: [
-                "-DUSE_VR_COMPOSER=0",
-            ],
-        },
-    },
     logtags: ["EventLog/EventLogTags.logtags"],
 }
 

@@ -46,13 +46,13 @@ static const char* native_processes_to_dump[] = {
 
 // Native processes to dump on debuggable builds.
 static const char* debuggable_native_processes_to_dump[] = {
+        "/system/bin/keystore2",
         "/system/bin/vold",
         NULL,
 };
 
 /* list of hal interface to dump containing process during native dumps */
 static const char* hal_interfaces_to_dump[] {
-        "android.hardware.audio@2.0::IDevicesFactory",
         "android.hardware.audio@4.0::IDevicesFactory",
         "android.hardware.audio@5.0::IDevicesFactory",
         "android.hardware.audio@6.0::IDevicesFactory",

@@ -46,7 +46,6 @@
 #include <cutils/compiler.h>
 #include <cutils/properties.h>
 #include <dlfcn.h>
-#include <dvr/vr_flinger.h>
 #include <errno.h>
 #include <gui/BufferQueue.h>
 #include <gui/DebugEGLImageTracker.h>
@@ -267,7 +266,6 @@ int64_t SurfaceFlinger::dispSyncPresentTimeOffset;
 bool SurfaceFlinger::useHwcForRgbToYuv;
 uint64_t SurfaceFlinger::maxVirtualDisplaySize;
 bool SurfaceFlinger::hasSyncFramework;
-bool SurfaceFlinger::useVrFlinger;
 int64_t SurfaceFlinger::maxFrameBufferAcquiredBuffers;
 uint32_t SurfaceFlinger::maxGraphicsWidth;
 uint32_t SurfaceFlinger::maxGraphicsHeight;
@@ -331,9 +329,6 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
     useHwcForRgbToYuv = force_hwc_copy_for_virtual_displays(false);
 
     maxVirtualDisplaySize = max_virtual_display_dimension(0);
-
-    // Vr flinger is only enabled on Daydream ready devices.
-    useVrFlinger = use_vr_flinger(false);
 
     maxFrameBufferAcquiredBuffers = max_frame_buffer_acquired_buffers(2);
 
@@ -601,17 +596,6 @@ void SurfaceFlinger::bootFinished()
     if (mWindowManager != 0) {
         mWindowManager->linkToDeath(static_cast<IBinder::DeathRecipient*>(this));
     }
-    sp<IBinder> input(defaultServiceManager()->getService(
-            String16("inputflinger")));
-    if (input == nullptr) {
-        ALOGE("Failed to link to input service");
-    } else {
-        mInputFlinger = interface_cast<IInputFlinger>(input);
-    }
-
-    if (mVrFlinger) {
-      mVrFlinger->OnBootFinished();
-    }
 
     // stop boot animation
     // formerly we would just kill the process, but we now ask it to exit so it
@@ -622,7 +606,15 @@ void SurfaceFlinger::bootFinished()
     LOG_EVENT_LONG(LOGTAG_SF_STOP_BOOTANIM,
                    ns2ms(systemTime(SYSTEM_TIME_MONOTONIC)));
 
-    static_cast<void>(schedule([this] {
+    sp<IBinder> input(defaultServiceManager()->getService(String16("inputflinger")));
+
+    static_cast<void>(schedule([=] {
+        if (input == nullptr) {
+            ALOGE("Failed to link to input service");
+        } else {
+            mInputFlinger = interface_cast<IInputFlinger>(input);
+        }
+
         readPersistentProperties();
         mPowerAdvisor.onBootFinished();
         mBootStage = BootStage::FINISHED;
@@ -688,9 +680,6 @@ void SurfaceFlinger::init() {
                         : renderengine::RenderEngine::ContextPriority::MEDIUM)
                 .build()));
     mCompositionEngine->setTimeStats(mTimeStats);
-
-    LOG_ALWAYS_FATAL_IF(mVrFlingerRequestsDisplay,
-            "Starting with vr flinger active is not currently supported.");
     mCompositionEngine->setHwComposer(getFactory().createHWComposer(getBE().mHwcServiceName));
     mCompositionEngine->getHwComposer().setConfiguration(this, getBE().mComposerSequenceId);
     // Process any initial hotplug and resulting display changes.
@@ -699,30 +688,6 @@ void SurfaceFlinger::init() {
     LOG_ALWAYS_FATAL_IF(!display, "Missing internal display after registering composer callback.");
     LOG_ALWAYS_FATAL_IF(!getHwComposer().isConnected(*display->getId()),
                         "Internal display is disconnected.");
-
-    if (useVrFlinger) {
-        auto vrFlingerRequestDisplayCallback = [this](bool requestDisplay) {
-            // This callback is called from the vr flinger dispatch thread. We
-            // need to call signalTransaction(), which requires holding
-            // mStateLock when we're not on the main thread. Acquiring
-            // mStateLock from the vr flinger dispatch thread might trigger a
-            // deadlock in surface flinger (see b/66916578), so post a message
-            // to be handled on the main thread instead.
-            static_cast<void>(schedule([=] {
-                ALOGI("VR request display mode: requestDisplay=%d", requestDisplay);
-                mVrFlingerRequestsDisplay = requestDisplay;
-                signalTransaction();
-            }));
-        };
-        mVrFlinger = dvr::VrFlinger::Create(getHwComposer().getComposer(),
-                                            getHwComposer()
-                                                    .fromPhysicalDisplayId(*display->getId())
-                                                    .value_or(0),
-                                            vrFlingerRequestDisplayCallback);
-        if (!mVrFlinger) {
-            ALOGE("Failed to start vrflinger");
-        }
-    }
 
     // initialize our drawing state
     mDrawingState = mCurrentState;
@@ -1700,98 +1665,6 @@ void SurfaceFlinger::setPrimaryVsyncEnabledInternal(bool enabled) {
     }
 }
 
-void SurfaceFlinger::resetDisplayState() {
-    mScheduler->disableHardwareVsync(true);
-    // Clear the drawing state so that the logic inside of
-    // handleTransactionLocked will fire. It will determine the delta between
-    // mCurrentState and mDrawingState and re-apply all changes when we make the
-    // transition.
-    mDrawingState.displays.clear();
-    mDisplays.clear();
-}
-
-void SurfaceFlinger::updateVrFlinger() {
-    ATRACE_CALL();
-    if (!mVrFlinger)
-        return;
-    bool vrFlingerRequestsDisplay = mVrFlingerRequestsDisplay;
-    if (vrFlingerRequestsDisplay == getHwComposer().isUsingVrComposer()) {
-        return;
-    }
-
-    if (vrFlingerRequestsDisplay && !getHwComposer().getComposer()->isRemote()) {
-        ALOGE("Vr flinger is only supported for remote hardware composer"
-              " service connections. Ignoring request to transition to vr"
-              " flinger.");
-        mVrFlingerRequestsDisplay = false;
-        return;
-    }
-
-    Mutex::Autolock _l(mStateLock);
-
-    sp<DisplayDevice> display = getDefaultDisplayDeviceLocked();
-    LOG_ALWAYS_FATAL_IF(!display);
-
-    const hal::PowerMode currentDisplayPowerMode = display->getPowerMode();
-
-    // Clear out all the output layers from the composition engine for all
-    // displays before destroying the hardware composer interface. This ensures
-    // any HWC layers are destroyed through that interface before it becomes
-    // invalid.
-    for (const auto& [token, displayDevice] : mDisplays) {
-        displayDevice->getCompositionDisplay()->clearOutputLayers();
-    }
-
-    // This DisplayDevice will no longer be relevant once resetDisplayState() is
-    // called below. Clear the reference now so we don't accidentally use it
-    // later.
-    display.clear();
-
-    if (!vrFlingerRequestsDisplay) {
-        mVrFlinger->SeizeDisplayOwnership();
-    }
-
-    resetDisplayState();
-    // Delete the current instance before creating the new one
-    mCompositionEngine->setHwComposer(std::unique_ptr<HWComposer>());
-    mCompositionEngine->setHwComposer(getFactory().createHWComposer(
-            vrFlingerRequestsDisplay ? "vr" : getBE().mHwcServiceName));
-    mCompositionEngine->getHwComposer().setConfiguration(this, ++getBE().mComposerSequenceId);
-
-    LOG_ALWAYS_FATAL_IF(!getHwComposer().getComposer()->isRemote(),
-                        "Switched to non-remote hardware composer");
-
-    if (vrFlingerRequestsDisplay) {
-        mVrFlinger->GrantDisplayOwnership();
-    }
-
-    mVisibleRegionsDirty = true;
-    invalidateHwcGeometry();
-
-    // Re-enable default display.
-    display = getDefaultDisplayDeviceLocked();
-    LOG_ALWAYS_FATAL_IF(!display);
-    setPowerModeInternal(display, currentDisplayPowerMode);
-
-    // Reset the timing values to account for the period of the swapped in HWC
-    const nsecs_t vsyncPeriod = mRefreshRateConfigs->getCurrentRefreshRate().getVsyncPeriod();
-    mAnimFrameTracker.setDisplayRefreshPeriod(vsyncPeriod);
-
-    // The present fences returned from vr_hwc are not an accurate
-    // representation of vsync times.
-    mScheduler->setIgnorePresentFences(getHwComposer().isUsingVrComposer() || !hasSyncFramework);
-
-    // Use phase of 0 since phase is not known.
-    // Use latency of 0, which will snap to the ideal latency.
-    DisplayStatInfo stats{0 /* vsyncTime */, vsyncPeriod};
-    setCompositorTimingSnapped(stats, 0);
-
-    mScheduler->resyncToHardwareVsync(false, vsyncPeriod);
-
-    mRepaintEverything = true;
-    setTransactionFlags(eDisplayTransactionNeeded);
-}
-
 sp<Fence> SurfaceFlinger::previousFrameFence() {
     // We are storing the last 2 present fences. If sf's phase offset is to be
     // woken up before the actual vsync but targeting the next vsync, we need to check
@@ -1853,8 +1726,14 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
     // calculate the expected present time once and use the cached
     // value throughout this frame to make sure all layers are
     // seeing this same value.
-    const nsecs_t lastExpectedPresentTime = mExpectedPresentTime.load();
-    mExpectedPresentTime = expectedVSyncTime;
+    if (expectedVSyncTime >= frameStart) {
+        mExpectedPresentTime = expectedVSyncTime;
+    } else {
+        mExpectedPresentTime = mScheduler->getDispSyncExpectedPresentTime(frameStart);
+    }
+
+    const nsecs_t lastScheduledPresentTime = mScheduledPresentTime;
+    mScheduledPresentTime = expectedVSyncTime;
 
     // When Backpressure propagation is enabled we want to give a small grace period
     // for the present fence to fire instead of just giving up on this frame to handle cases
@@ -1884,7 +1763,7 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
     const TracedOrdinal<bool> frameMissed = {"PrevFrameMissed",
                                              framePending ||
                                                      (previousPresentTime >= 0 &&
-                                                      (lastExpectedPresentTime <
+                                                      (lastScheduledPresentTime <
                                                        previousPresentTime - frameMissedSlop))};
     const TracedOrdinal<bool> hwcFrameMissed = {"PrevHwcFrameMissed",
                                                 mHadDeviceComposition && frameMissed};
@@ -1959,11 +1838,6 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
             }
         }
     }
-
-    // Now that we're going to make it to the handleMessageTransaction()
-    // call below it's safe to call updateVrFlinger(), which will
-    // potentially trigger a display handoff.
-    updateVrFlinger();
 
     if (mTracingEnabledChanged) {
         mTracingEnabled = mTracing.isEnabled();
@@ -2611,7 +2485,7 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
     builder.setIsSecure(state.isSecure);
     builder.setLayerStackId(state.layerStack);
     builder.setPowerAdvisor(&mPowerAdvisor);
-    builder.setUseHwcVirtualDisplays(mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer());
+    builder.setUseHwcVirtualDisplays(mUseHwcVirtualDisplays);
     builder.setName(state.displayName);
     const auto compositionDisplay = getCompositionEngine().createDisplay(builder.build());
 
@@ -4501,12 +4375,9 @@ void SurfaceFlinger::recordBufferingStats(const std::string& layerName,
 
 void SurfaceFlinger::dumpFrameEventsLocked(std::string& result) {
     result.append("Layer frame timestamps:\n");
-
-    const LayerVector& currentLayers = mCurrentState.layersSortedByZ;
-    const size_t count = currentLayers.size();
-    for (size_t i=0 ; i<count ; i++) {
-        currentLayers[i]->dumpFrameEvents(result);
-    }
+    // Traverse all layers to dump frame-events for each layer
+    mCurrentState.traverseInZOrder(
+        [&] (Layer* layer) { layer->dumpFrameEvents(result); });
 }
 
 void SurfaceFlinger::dumpBufferingStats(std::string& result) const {
@@ -4834,15 +4705,6 @@ void SurfaceFlinger::dumpAllLocked(const DumpArgs& args, std::string& result) co
      */
     const GraphicBufferAllocator& alloc(GraphicBufferAllocator::get());
     alloc.dump(result);
-
-    /*
-     * Dump VrFlinger state if in use.
-     */
-    if (mVrFlingerRequestsDisplay && mVrFlinger) {
-        result.append("VrFlinger state:\n");
-        result.append(mVrFlinger->Dump());
-        result.append("\n");
-    }
 
     result.append(mTimeStats->miniDump());
     result.append("\n");
@@ -5226,11 +5088,8 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
                 }
                 return NO_ERROR;
             }
-            // Is VrFlinger active?
-            case 1028: {
-                Mutex::Autolock _l(mStateLock);
-                reply->writeBool(getHwComposer().isUsingVrComposer());
-                return NO_ERROR;
+            case 1028: { // Unused.
+                return NAME_NOT_FOUND;
             }
             // Set buffer size for SF tracing (value in KB)
             case 1029: {
@@ -6209,9 +6068,6 @@ const std::unordered_map<std::string, uint32_t>& SurfaceFlinger::getGenericLayer
     // on the work to remove the table in that bug rather than adding more to
     // it.
     static const std::unordered_map<std::string, uint32_t> genericLayerMetadataKeyMap{
-            // Note: METADATA_OWNER_UID and METADATA_WINDOW_TYPE are officially
-            // supported, and exposed via the
-            // IVrComposerClient::VrCommand::SET_LAYER_INFO command.
             {"org.chromium.arc.V1_0.TaskId", METADATA_TASK_ID},
             {"org.chromium.arc.V1_0.CursorInfo", METADATA_MOUSE_CURSOR},
     };

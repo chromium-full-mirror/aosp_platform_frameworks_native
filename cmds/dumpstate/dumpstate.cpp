@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/poll.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -174,6 +175,7 @@ void add_mountinfo();
 #define SNAPSHOTCTL_LOG_DIR "/data/misc/snapshotctl_log"
 #define LINKERCONFIG_DIR "/linkerconfig"
 #define PACKAGE_DEX_USE_LIST "/data/system/package-dex-usage.list"
+#define SYSTEM_TRACE_SNAPSHOT "/data/misc/perfetto-traces/bugreport/systrace.pftrace"
 
 // TODO(narayan): Since this information has to be kept in sync
 // with tombstoned, we should just put it in a common header.
@@ -791,6 +793,9 @@ void Dumpstate::PrintHeader() const {
     if (module_metadata_version != 0) {
         printf("Module Metadata version: %" PRId64 "\n", module_metadata_version);
     }
+    printf("SDK extension versions [r=%s s=%s]\n",
+           android::base::GetProperty("build.version.extensions.r", "-").c_str(),
+           android::base::GetProperty("build.version.extensions.s", "-").c_str());
 
     printf("Kernel: ");
     DumpFileToFd(STDOUT_FILENO, "", "/proc/version");
@@ -1052,6 +1057,24 @@ static void DumpIncidentReport() {
     }
 }
 
+static void MaybeAddSystemTraceToZip() {
+    // This function copies into the .zip the system trace that was snapshotted
+    // by the early call to MaybeSnapshotSystemTrace(), if any background
+    // tracing was happening.
+    if (!ds.IsZipping()) {
+        MYLOGD("Not dumping system trace because it's not a zipped bugreport\n");
+        return;
+    }
+    if (!ds.has_system_trace_) {
+        // No background trace was happening at the time dumpstate was invoked.
+        return;
+    }
+    ds.AddZipEntry(
+            ZIP_ROOT_DIR + SYSTEM_TRACE_SNAPSHOT,
+            SYSTEM_TRACE_SNAPSHOT);
+    android::os::UnlinkAndLogOnError(SYSTEM_TRACE_SNAPSHOT);
+}
+
 static void DumpVisibleWindowViews() {
     if (!ds.IsZipping()) {
         MYLOGD("Not dumping visible views because it's not a zipped bugreport\n");
@@ -1188,10 +1211,6 @@ static void DumpBlockStatFiles() {
 
 static void DumpPacketStats() {
     DumpFile("NETWORK DEV INFO", "/proc/net/dev");
-    DumpFile("QTAGUID NETWORK INTERFACES INFO", "/proc/net/xt_qtaguid/iface_stat_all");
-    DumpFile("QTAGUID NETWORK INTERFACES INFO (xt)", "/proc/net/xt_qtaguid/iface_stat_fmt");
-    DumpFile("QTAGUID CTRL INFO", "/proc/net/xt_qtaguid/ctrl");
-    DumpFile("QTAGUID STATS INFO", "/proc/net/xt_qtaguid/stats");
 }
 
 static void DumpIpAddrAndRules() {
@@ -1217,12 +1236,19 @@ static Dumpstate::RunStatus RunDumpsysTextByPriority(const std::string& title, i
         std::string path(title);
         path.append(" - ").append(String8(service).c_str());
         size_t bytes_written = 0;
-        status_t status = dumpsys.startDumpThread(Dumpsys::Type::DUMP, service, args);
+        status_t status = dumpsys.startDumpThread(Dumpsys::TYPE_DUMP, service, args);
         if (status == OK) {
             dumpsys.writeDumpHeader(STDOUT_FILENO, service, priority);
             std::chrono::duration<double> elapsed_seconds;
-            status = dumpsys.writeDump(STDOUT_FILENO, service, service_timeout,
-                                       /* as_proto = */ false, elapsed_seconds, bytes_written);
+            if (priority == IServiceManager::DUMP_FLAG_PRIORITY_HIGH &&
+                service == String16("meminfo")) {
+                // Use a longer timeout for meminfo, since 30s is not always enough.
+                status = dumpsys.writeDump(STDOUT_FILENO, service, 60s,
+                                           /* as_proto = */ false, elapsed_seconds, bytes_written);
+            } else {
+                status = dumpsys.writeDump(STDOUT_FILENO, service, service_timeout,
+                                           /* as_proto = */ false, elapsed_seconds, bytes_written);
+            }
             dumpsys.writeDumpFooter(STDOUT_FILENO, service, elapsed_seconds);
             bool dump_complete = (status == OK);
             dumpsys.stopDumpThread(dump_complete);
@@ -1289,7 +1315,7 @@ static Dumpstate::RunStatus RunDumpsysProto(const std::string& title, int priori
             path.append("_HIGH");
         }
         path.append(kProtoExt);
-        status_t status = dumpsys.startDumpThread(Dumpsys::Type::DUMP, service, args);
+        status_t status = dumpsys.startDumpThread(Dumpsys::TYPE_DUMP, service, args);
         if (status == OK) {
             status = ds.AddZipEntryFromFd(path, dumpsys.getDumpFd(), service_timeout);
             bool dumpTerminated = (status == OK);
@@ -1548,7 +1574,7 @@ static void DumpAppInfos(int out_fd = STDOUT_FILENO) {
     dprintf(out_fd, "========================================================\n");
 
     RunDumpsys("APP PROVIDERS PLATFORM", {"activity", "provider", "all-platform"},
-            DUMPSYS_COMPONENTS_OPTIONS, out_fd);
+            DUMPSYS_COMPONENTS_OPTIONS, 0, out_fd);
 
     dprintf(out_fd, "========================================================\n");
     dprintf(out_fd, "== Running Application Providers (non-platform)\n");
@@ -1621,6 +1647,10 @@ static Dumpstate::RunStatus dumpstate() {
         MYLOGD("Skipping 'lsmod' because /proc/modules does not exist\n");
     } else {
         RunCommand("LSMOD", {"lsmod"});
+        RunCommand("MODULES INFO",
+                   {"sh", "-c", "cat /proc/modules | cut -d' ' -f1 | "
+                    "    while read MOD ; do echo modinfo:$MOD ; modinfo $MOD ; "
+                    "done"}, CommandOptions::AS_ROOT);
     }
 
     if (android::base::GetBoolProperty("ro.logd.kernel", false)) {
@@ -1636,8 +1666,6 @@ static Dumpstate::RunStatus dumpstate() {
     for_each_tid(show_wchan, "BLOCKED PROCESS WAIT-CHANNELS");
     for_each_pid(show_showtime, "PROCESS TIMES (pid cmd user system iowait+percentage)");
 
-    /* Dump Bluetooth HCI logs */
-    ds.AddDir("/data/misc/bluetooth/logs", true);
     /* Dump Nfc NCI logs */
     ds.AddDir("/data/misc/nfc/logs", true);
 
@@ -1647,6 +1675,8 @@ static Dumpstate::RunStatus dumpstate() {
     }
 
     AddAnrTraceFiles();
+
+    MaybeAddSystemTraceToZip();
 
     // NOTE: tombstones are always added as separate entries in the zip archive
     // and are not interspersed with the main report.
@@ -1671,6 +1701,12 @@ static Dumpstate::RunStatus dumpstate() {
     RunCommand("MULTICAST ADDRESSES", {"ip", "maddr"});
 
     RUN_SLOW_FUNCTION_WITH_CONSENT_CHECK(RunDumpsysHigh);
+
+    // The dump mechanism in connectivity is refactored due to modularization work. Connectivity can
+    // only register with a default priority(NORMAL priority). Dumpstate has to call connectivity
+    // dump with priority parameters to dump high priority information.
+    RunDumpsys("SERVICE HIGH connectivity", {"connectivity", "--dump-priority", "HIGH"},
+                   CommandOptions::WithTimeout(10).Build());
 
     RunCommand("SYSTEM PROPERTIES", {"getprop"});
 
@@ -1720,6 +1756,9 @@ static Dumpstate::RunStatus dumpstate() {
     printf("========================================================\n");
 
     RUN_SLOW_FUNCTION_WITH_CONSENT_CHECK(RunDumpsysNormal);
+
+    /* Dump Bluetooth HCI logs after getting bluetooth_manager dumpsys */
+    ds.AddDir("/data/misc/bluetooth/logs", true);
 
     if (ds.dump_pool_) {
         WAIT_TASK_WITH_CONSENT_CHECK(DUMP_CHECKINS_TASK, ds.dump_pool_);
@@ -1823,10 +1862,8 @@ Dumpstate::RunStatus Dumpstate::DumpstateDefaultAfterCritical() {
     RunCommand("IOTOP", {"iotop", "-n", "1", "-m", "100"});
 
     // Gather shared memory buffer info if the product implements it
-    struct stat st;
-    if (!stat("/product/bin/dmabuf_dump", &st)) {
-        RunCommand("Dmabuf dump", {"/product/bin/dmabuf_dump"});
-    }
+    RunCommand("Dmabuf dump", {"dmabuf_dump"});
+    RunCommand("Dmabuf per-buffer/per-exporter/per-device stats", {"dmabuf_dump", "-b"});
 
     DumpFile("PSI cpu", "/proc/pressure/cpu");
     DumpFile("PSI memory", "/proc/pressure/memory");
@@ -1939,6 +1976,8 @@ static void DumpstateTelephonyOnly(const std::string& calling_package) {
 
     RunDumpsys("DUMPSYS", {"connectivity"}, CommandOptions::WithTimeout(90).Build(),
                SEC_TO_MSEC(10));
+    RunDumpsys("DUMPSYS", {"vcn_management"}, CommandOptions::WithTimeout(90).Build(),
+               SEC_TO_MSEC(10));
     if (include_sensitive_info) {
         // Carrier apps' services will be dumped below in dumpsys activity service all-non-platform.
         RunDumpsys("DUMPSYS", {"carrier_config"}, CommandOptions::WithTimeout(90).Build(),
@@ -2039,7 +2078,7 @@ static void DumpstateWifiOnly() {
 }
 
 Dumpstate::RunStatus Dumpstate::DumpTraces(const char** path) {
-    const std::string temp_file_pattern = "/data/anr/dumptrace_XXXXXX";
+    const std::string temp_file_pattern = ds.bugreport_internal_dir_ + "/dumptrace_XXXXXX";
     const size_t buf_size = temp_file_pattern.length() + 1;
     std::unique_ptr<char[]> file_name_buf(new char[buf_size]);
     memcpy(file_name_buf.get(), temp_file_pattern.c_str(), buf_size);
@@ -2156,6 +2195,21 @@ void Dumpstate::DumpstateBoard(int out_fd) {
         return;
     }
 
+    /*
+     * mount debugfs for non-user builds with ro.product.debugfs_restrictions.enabled
+     * set to true and unmount it after invoking dumpstateBoard_* methods.
+     * This is to enable debug builds to not have debugfs mounted during runtime.
+     * It will also ensure that debugfs is only accessed by the dumpstate HAL.
+     */
+    auto mount_debugfs =
+        android::base::GetBoolProperty("ro.product.debugfs_restrictions.enabled", false);
+    if (mount_debugfs) {
+        RunCommand("mount debugfs", {"mount", "-t", "debugfs", "debugfs", "/sys/kernel/debug"},
+                   AS_ROOT_20);
+        RunCommand("chmod debugfs", {"chmod", "0755", "/sys/kernel/debug"},
+                   AS_ROOT_20);
+    }
+
     std::vector<std::string> paths;
     std::vector<android::base::ScopeGuard<std::function<void()>>> remover;
     for (int i = 0; i < NUM_OF_DUMPS; i++) {
@@ -2253,6 +2307,13 @@ void Dumpstate::DumpstateBoard(int out_fd) {
     if (result.wait_for(std::chrono::seconds(killing_timeout_sec)) != std::future_status::ready) {
         MYLOGE("killing dumpstateBoard timed out after %zus, continue and "
                "there might be racing in content\n", killing_timeout_sec);
+    }
+
+    if (mount_debugfs) {
+        auto keep_debugfs_mounted =
+            android::base::GetProperty("persist.dbg.keep_debugfs_mounted", "");
+        if (keep_debugfs_mounted.empty())
+            RunCommand("unmount debugfs", {"umount", "/sys/kernel/debug"}, AS_ROOT_20);
     }
 
     auto file_sizes = std::make_unique<ssize_t[]>(paths.size());
@@ -2865,6 +2926,17 @@ Dumpstate::RunStatus Dumpstate::RunInternal(int32_t calling_uid,
         RunDumpsysCritical();
     }
     MaybeTakeEarlyScreenshot();
+
+    if (!is_dumpstate_restricted) {
+        // Snapshot the system trace now (if running) to avoid that dumpstate's
+        // own activity pushes out interesting data from the trace ring buffer.
+        // The trace file is added to the zip by MaybeAddSystemTraceToZip().
+        MaybeSnapshotSystemTrace();
+
+        // If a winscope trace is running, snapshot it now. It will be pulled into bugreport later
+        // from WMTRACE_DATA_DIR.
+        MaybeSnapshotWinTrace();
+    }
     onUiIntensiveBugreportDumpsFinished(calling_uid);
     MaybeCheckUserConsent(calling_uid, calling_package);
     if (options_->telephony_only) {
@@ -2955,6 +3027,37 @@ void Dumpstate::MaybeTakeEarlyScreenshot() {
     TakeScreenshot();
 }
 
+void Dumpstate::MaybeSnapshotSystemTrace() {
+    // If a background system trace is happening and is marked as "suitable for
+    // bugreport" (i.e. bugreport_score > 0 in the trace config), this command
+    // will stop it and serialize into SYSTEM_TRACE_SNAPSHOT. In the (likely)
+    // case that no trace is ongoing, this command is a no-op.
+    // Note: this should not be enqueued as we need to freeze the trace before
+    // dumpstate starts. Otherwise the trace ring buffers will contain mostly
+    // the dumpstate's own activity which is irrelevant.
+    int res = RunCommand(
+        "SERIALIZE PERFETTO TRACE",
+        {"perfetto", "--save-for-bugreport"},
+        CommandOptions::WithTimeout(10)
+            .DropRoot()
+            .CloseAllFileDescriptorsOnExec()
+            .Build());
+    has_system_trace_ = res == 0;
+    // MaybeAddSystemTraceToZip() will take care of copying the trace in the zip
+    // file in the later stages.
+}
+
+void Dumpstate::MaybeSnapshotWinTrace() {
+    // Currently WindowManagerService and InputMethodManagerSerivice support WinScope protocol.
+    for (const auto& service : {"window", "input_method"}) {
+        RunCommand(
+            // Empty name because it's not intended to be classified as a bugreport section.
+            // Actual tracing files can be found in "/data/misc/wmtrace/" in the bugreport.
+            "", {"cmd", service, "tracing", "save-for-bugreport"},
+            CommandOptions::WithTimeout(10).Always().DropRoot().RedirectStderr().Build());
+    }
+}
+
 void Dumpstate::onUiIntensiveBugreportDumpsFinished(int32_t calling_uid) {
     if (calling_uid == AID_SHELL || !CalledByApi()) {
         return;
@@ -2999,6 +3102,9 @@ void Dumpstate::CleanupTmpFiles() {
     android::os::UnlinkAndLogOnError(tmp_path_);
     android::os::UnlinkAndLogOnError(screenshot_path_);
     android::os::UnlinkAndLogOnError(path_);
+    if (dump_traces_path != nullptr) {
+        android::os::UnlinkAndLogOnError(dump_traces_path);
+    }
 }
 
 void Dumpstate::EnableParallelRunIfNeeded() {

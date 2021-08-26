@@ -606,44 +606,9 @@ void DestroySurfaceKHR(VkInstance instance,
 VKAPI_ATTR
 VkResult GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice /*pdev*/,
                                             uint32_t /*queue_family*/,
-                                            VkSurfaceKHR surface_handle,
+                                            VkSurfaceKHR /*surface_handle*/,
                                             VkBool32* supported) {
-    ATRACE_CALL();
-
-    const Surface* surface = SurfaceFromHandle(surface_handle);
-    if (!surface) {
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-    const ANativeWindow* window = surface->window.get();
-
-    int query_value;
-    int err = window->query(window, NATIVE_WINDOW_FORMAT, &query_value);
-    if (err != android::OK || query_value < 0) {
-        ALOGE("NATIVE_WINDOW_FORMAT query failed: %s (%d) value=%d",
-              strerror(-err), err, query_value);
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-
-    android_pixel_format native_format =
-        static_cast<android_pixel_format>(query_value);
-
-    bool format_supported = false;
-    switch (native_format) {
-        case HAL_PIXEL_FORMAT_RGBA_8888:
-        case HAL_PIXEL_FORMAT_RGB_565:
-        case HAL_PIXEL_FORMAT_RGBA_FP16:
-        case HAL_PIXEL_FORMAT_RGBA_1010102:
-            format_supported = true;
-            break;
-        default:
-            break;
-    }
-
-    *supported = static_cast<VkBool32>(
-        format_supported || (surface->consumer_usage &
-                             (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
-                              AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)) == 0);
-
+    *supported = VK_TRUE;
     return VK_SUCCESS;
 }
 
@@ -1123,16 +1088,10 @@ VkResult CreateSwapchainKHR(VkDevice device,
     ALOGW_IF(err != android::OK, "native_window_api_connect failed: %s (%d)",
              strerror(-err), err);
 
-    err = window->perform(window, NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT, -1);
+    err =
+        window->perform(window, NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT, nsecs_t{-1});
     if (err != android::OK) {
         ALOGE("window->perform(SET_DEQUEUE_TIMEOUT) failed: %s (%d)",
-              strerror(-err), err);
-        return VK_ERROR_SURFACE_LOST_KHR;
-    }
-
-    err = native_window_set_buffer_count(window, 0);
-    if (err != android::OK) {
-        ALOGE("native_window_set_buffer_count(0) failed: %s (%d)",
               strerror(-err), err);
         return VK_ERROR_SURFACE_LOST_KHR;
     }
@@ -1744,7 +1703,7 @@ VkResult QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
                 if (err != android::OK) {
                     ALOGE("queueBuffer failed: %s (%d)", strerror(-err), err);
                     swapchain_result = WorstPresentResult(
-                        swapchain_result, VK_ERROR_OUT_OF_DATE_KHR);
+                        swapchain_result, VK_ERROR_SURFACE_LOST_KHR);
                 } else {
                     if (img.dequeue_fence >= 0) {
                         close(img.dequeue_fence);

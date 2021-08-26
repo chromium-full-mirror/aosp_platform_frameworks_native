@@ -62,7 +62,7 @@ using hardware::atrace::V1_0::toString;
 
 using std::string;
 
-#define MAX_SYS_FILES 11
+#define MAX_SYS_FILES 12
 
 const char* k_traceTagsProperty = "debug.atrace.tags.enableflags";
 const char* k_userInitiatedTraceProperty = "debug.atrace.user_initiated";
@@ -124,7 +124,6 @@ static const TracingCategory k_categories[] = {
     { "aidl",       "AIDL calls",               ATRACE_TAG_AIDL, { } },
     { "nnapi",      "NNAPI",                    ATRACE_TAG_NNAPI, { } },
     { "rro",        "Runtime Resource Overlay", ATRACE_TAG_RRO, { } },
-    { "sysprop",    "System Property",          ATRACE_TAG_SYSPROP, { } },
     { k_coreServiceCategory, "Core services", 0, { } },
     { k_pdxServiceCategory, "PDX services", 0, { } },
     { "sched",      "CPU Scheduling",   0, {
@@ -175,6 +174,7 @@ static const TracingCategory k_categories[] = {
         { OPT,      "events/power/suspend_resume/enable" },
         { OPT,      "events/cpuhp/cpuhp_enter/enable" },
         { OPT,      "events/cpuhp/cpuhp_exit/enable" },
+        { OPT,      "events/cpuhp/cpuhp_pause/enable" },
     } },
     { "membus",     "Memory Bus Utilization", 0, {
         { REQ,      "events/memory_bus/enable" },
@@ -318,9 +318,6 @@ static const char* k_funcgraphCpuPath =
 
 static const char* k_funcgraphProcPath =
     "options/funcgraph-proc";
-
-static const char* k_funcgraphFlatPath =
-    "options/funcgraph-flat";
 
 static const char* k_ftraceFilterPath =
     "set_ftrace_filter";
@@ -699,7 +696,6 @@ static bool setKernelTraceFuncs(const char* funcs)
         ok &= setKernelOptionEnable(k_funcgraphAbsTimePath, true);
         ok &= setKernelOptionEnable(k_funcgraphCpuPath, true);
         ok &= setKernelOptionEnable(k_funcgraphProcPath, true);
-        ok &= setKernelOptionEnable(k_funcgraphFlatPath, true);
 
         // Set the requested filter functions.
         ok &= truncateFile(k_ftraceFilterPath);

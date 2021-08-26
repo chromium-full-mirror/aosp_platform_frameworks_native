@@ -29,8 +29,6 @@
 #include <utils/SystemClock.h>
 #include <utils/threads.h>
 
-#include <private/binder/binder_module.h>
-
 #include <atomic>
 #include <errno.h>
 #include <inttypes.h>
@@ -43,6 +41,7 @@
 #include <unistd.h>
 
 #include "Static.h"
+#include "binder_module.h"
 
 #if LOG_NDEBUG
 
@@ -90,6 +89,8 @@ static const char *kReturnStrings[] = {
     "BR_DEAD_BINDER",
     "BR_CLEAR_DEATH_NOTIFICATION_DONE",
     "BR_FAILED_REPLY",
+    "BR_FROZEN_REPLY",
+    "BR_ONEWAY_SPAM_SUSPECT",
     "BR_TRANSACTION_SEC_CTX",
 };
 
@@ -365,17 +366,44 @@ status_t IPCThreadState::clearLastError()
 
 pid_t IPCThreadState::getCallingPid() const
 {
+    checkContextIsBinderForUse(__func__);
     return mCallingPid;
 }
 
 const char* IPCThreadState::getCallingSid() const
 {
+    checkContextIsBinderForUse(__func__);
     return mCallingSid;
 }
 
 uid_t IPCThreadState::getCallingUid() const
 {
+    checkContextIsBinderForUse(__func__);
     return mCallingUid;
+}
+
+const IPCThreadState::SpGuard* IPCThreadState::pushGetCallingSpGuard(const SpGuard* guard) {
+    const SpGuard* orig = mServingStackPointerGuard;
+    mServingStackPointerGuard = guard;
+    return orig;
+}
+
+void IPCThreadState::restoreGetCallingSpGuard(const SpGuard* guard) {
+    mServingStackPointerGuard = guard;
+}
+
+void IPCThreadState::checkContextIsBinderForUse(const char* use) const {
+    if (LIKELY(mServingStackPointerGuard == nullptr)) return;
+
+    if (!mServingStackPointer || mServingStackPointerGuard->address < mServingStackPointer) {
+        LOG_ALWAYS_FATAL("In context %s, %s does not make sense (binder sp: %p, guard: %p).",
+                         mServingStackPointerGuard->context, use, mServingStackPointer,
+                         mServingStackPointerGuard->address);
+    }
+
+    // in the case mServingStackPointer is deeper in the stack than the guard,
+    // we must be serving a binder transaction (maybe nested). This is a binder
+    // context, so we don't abort
 }
 
 int64_t IPCThreadState::clearCallingIdentity()
@@ -486,15 +514,32 @@ void IPCThreadState::flushCommands()
     }
 }
 
+bool IPCThreadState::flushIfNeeded()
+{
+    if (mIsLooper || mServingStackPointer != nullptr || mIsFlushing) {
+        return false;
+    }
+    mIsFlushing = true;
+    // In case this thread is not a looper and is not currently serving a binder transaction,
+    // there's no guarantee that this thread will call back into the kernel driver any time
+    // soon. Therefore, flush pending commands such as BC_FREE_BUFFER, to prevent them from getting
+    // stuck in this thread's out buffer.
+    flushCommands();
+    mIsFlushing = false;
+    return true;
+}
+
 void IPCThreadState::blockUntilThreadAvailable()
 {
     pthread_mutex_lock(&mProcess->mThreadCountLock);
+    mProcess->mWaitingForThreads++;
     while (mProcess->mExecutingThreadsCount >= mProcess->mMaxThreads) {
         ALOGW("Waiting for thread to be free. mExecutingThreadsCount=%lu mMaxThreads=%lu\n",
                 static_cast<unsigned long>(mProcess->mExecutingThreadsCount),
                 static_cast<unsigned long>(mProcess->mMaxThreads));
         pthread_cond_wait(&mProcess->mThreadCountDecrement, &mProcess->mThreadCountLock);
     }
+    mProcess->mWaitingForThreads--;
     pthread_mutex_unlock(&mProcess->mThreadCountLock);
 }
 
@@ -534,7 +579,12 @@ status_t IPCThreadState::getAndExecuteCommand()
             }
             mProcess->mStarvationStartTimeMs = 0;
         }
-        pthread_cond_broadcast(&mProcess->mThreadCountDecrement);
+
+        // Cond broadcast can be expensive, so don't send it every time a binder
+        // call is processed. b/168806193
+        if (mProcess->mWaitingForThreads > 0) {
+            pthread_cond_broadcast(&mProcess->mThreadCountDecrement);
+        }
         pthread_mutex_unlock(&mProcess->mThreadCountLock);
     }
 
@@ -597,6 +647,7 @@ void IPCThreadState::joinThreadPool(bool isMain)
 
     mOut.writeInt32(isMain ? BC_ENTER_LOOPER : BC_REGISTER_LOOPER);
 
+    mIsLooper = true;
     status_t result;
     do {
         processPendingDerefs();
@@ -619,6 +670,7 @@ void IPCThreadState::joinThreadPool(bool isMain)
         (void*)pthread_self(), getpid(), result);
 
     mOut.writeInt32(BC_EXIT_LOOPER);
+    mIsLooper = false;
     talkWithDriver(false);
 }
 
@@ -629,6 +681,7 @@ status_t IPCThreadState::setupPolling(int* fd)
     }
 
     mOut.writeInt32(BC_ENTER_LOOPER);
+    flushCommands();
     *fd = mProcess->mDriverFD;
     return 0;
 }
@@ -660,6 +713,8 @@ status_t IPCThreadState::transact(int32_t handle,
                                   uint32_t code, const Parcel& data,
                                   Parcel* reply, uint32_t flags)
 {
+    LOG_ALWAYS_FATAL_IF(data.isForRpc(), "Parcel constructed for RPC, but being used with binder.");
+
     status_t err;
 
     flags |= TF_ACCEPT_FDS;
@@ -731,9 +786,11 @@ void IPCThreadState::incStrongHandle(int32_t handle, BpBinder *proxy)
     LOG_REMOTEREFS("IPCThreadState::incStrongHandle(%d)\n", handle);
     mOut.writeInt32(BC_ACQUIRE);
     mOut.writeInt32(handle);
-    // Create a temp reference until the driver has handled this command.
-    proxy->incStrong(mProcess.get());
-    mPostWriteStrongDerefs.push(proxy);
+    if (!flushIfNeeded()) {
+        // Create a temp reference until the driver has handled this command.
+        proxy->incStrong(mProcess.get());
+        mPostWriteStrongDerefs.push(proxy);
+    }
 }
 
 void IPCThreadState::decStrongHandle(int32_t handle)
@@ -741,6 +798,7 @@ void IPCThreadState::decStrongHandle(int32_t handle)
     LOG_REMOTEREFS("IPCThreadState::decStrongHandle(%d)\n", handle);
     mOut.writeInt32(BC_RELEASE);
     mOut.writeInt32(handle);
+    flushIfNeeded();
 }
 
 void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
@@ -748,9 +806,11 @@ void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
     LOG_REMOTEREFS("IPCThreadState::incWeakHandle(%d)\n", handle);
     mOut.writeInt32(BC_INCREFS);
     mOut.writeInt32(handle);
-    // Create a temp reference until the driver has handled this command.
-    proxy->getWeakRefs()->incWeak(mProcess.get());
-    mPostWriteWeakDerefs.push(proxy->getWeakRefs());
+    if (!flushIfNeeded()) {
+        // Create a temp reference until the driver has handled this command.
+        proxy->getWeakRefs()->incWeak(mProcess.get());
+        mPostWriteWeakDerefs.push(proxy->getWeakRefs());
+    }
 }
 
 void IPCThreadState::decWeakHandle(int32_t handle)
@@ -758,6 +818,7 @@ void IPCThreadState::decWeakHandle(int32_t handle)
     LOG_REMOTEREFS("IPCThreadState::decWeakHandle(%d)\n", handle);
     mOut.writeInt32(BC_DECREFS);
     mOut.writeInt32(handle);
+    flushIfNeeded();
 }
 
 status_t IPCThreadState::attemptIncStrongHandle(int32_t handle)
@@ -809,14 +870,16 @@ status_t IPCThreadState::clearDeathNotification(int32_t handle, BpBinder* proxy)
 }
 
 IPCThreadState::IPCThreadState()
-    : mProcess(ProcessState::self()),
-      mServingStackPointer(nullptr),
-      mWorkSource(kUnsetWorkSource),
-      mPropagateWorkSource(false),
-      mStrictModePolicy(0),
-      mLastTransactionBinderFlags(0),
-      mCallRestriction(mProcess->mCallRestriction)
-{
+      : mProcess(ProcessState::self()),
+        mServingStackPointer(nullptr),
+        mServingStackPointerGuard(nullptr),
+        mWorkSource(kUnsetWorkSource),
+        mPropagateWorkSource(false),
+        mIsLooper(false),
+        mIsFlushing(false),
+        mStrictModePolicy(0),
+        mLastTransactionBinderFlags(0),
+        mCallRestriction(mProcess->mCallRestriction) {
     pthread_setspecific(gTLS, this);
     clearCaller();
     mIn.setDataCapacity(256);
@@ -856,6 +919,11 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
         }
 
         switch (cmd) {
+        case BR_ONEWAY_SPAM_SUSPECT:
+            ALOGE("Process seems to be sending too many oneway calls.");
+            CallStack::logStack("oneway spamming", CallStack::getCurrent().get(),
+                    ANDROID_LOG_ERROR);
+            [[fallthrough]];
         case BR_TRANSACTION_COMPLETE:
             if (!reply && !acquireResult) goto finish;
             break;
@@ -1186,7 +1254,7 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
                 tr.offsets_size/sizeof(binder_size_t), freeBuffer);
 
             const void* origServingStackPointer = mServingStackPointer;
-            mServingStackPointer = &origServingStackPointer; // anything on the stack
+            mServingStackPointer = __builtin_frame_address(0);
 
             const pid_t origPid = mCallingPid;
             const char* origSid = mCallingSid;
@@ -1393,6 +1461,7 @@ void IPCThreadState::freeBuffer(Parcel* parcel, const uint8_t* data,
     IPCThreadState* state = self();
     state->mOut.writeInt32(BC_FREE_BUFFER);
     state->mOut.writePointer((uintptr_t)data);
+    state->flushIfNeeded();
 }
 
 } // namespace android

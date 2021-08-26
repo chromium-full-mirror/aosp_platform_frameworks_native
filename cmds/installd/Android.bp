@@ -1,3 +1,12 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "frameworks_native_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["frameworks_native_license"],
+}
+
 cc_defaults {
     name: "installd_defaults",
 
@@ -37,6 +46,12 @@ cc_defaults {
         "libselinux",
         "libutils",
         "server_configurable_flags",
+    ],
+    static_libs: [
+        "libasync_safe",
+    ],
+    export_shared_lib_headers: [
+        "libbinder",
     ],
 
     product_variables: {
@@ -177,8 +192,8 @@ cc_binary {
         "liblog",
         "libutils",
     ],
-    static_libs: [
-        "libapexd",
+    required: [
+      "apexd"
     ],
 }
 
@@ -239,6 +254,7 @@ cc_binary {
     ],
 
     static_libs: [
+        "libasync_safe",
         "libdiskusage",
         "libotapreoptparameters",
     ],

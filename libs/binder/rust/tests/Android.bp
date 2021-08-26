@@ -1,3 +1,12 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "frameworks_native_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["frameworks_native_license"],
+}
+
 rust_test {
     name: "rustBinderTest",
     srcs: ["integration.rs"],
@@ -41,7 +50,7 @@ cc_test {
         "libbinder_ndk",
     ],
     static_libs: [
-        "IBinderRustNdkInteropTest-ndk_platform",
+        "IBinderRustNdkInteropTest-ndk",
         "libbinder_ndk_rust_interop",
     ],
     test_suites: ["general-tests"],
@@ -77,5 +86,52 @@ rust_ffi_static {
     rustlibs: [
         "libbinder_rs",
         "IBinderRustNdkInteropTest-rust",
+    ],
+}
+
+cc_test {
+    name: "rustBinderSerializationTest",
+    shared_libs: [
+        "libbinder",
+        "libbinder_ndk",
+        "libutils",
+        "libbase",
+    ],
+    static_libs: [
+        "libbinder_rs_serialization_test"
+    ],
+    srcs: [
+        "serialization.cpp",
+    ],
+    auto_gen_config: true,
+    test_suites: ["general-tests"],
+}
+
+rust_bindgen {
+    name: "libbinder_rs_serialization_bindgen",
+    crate_name: "binder_rs_serialization_bindgen",
+    wrapper_src: "serialization.hpp",
+    source_stem: "bindings",
+    cpp_std: "gnu++17",
+    bindgen_flags: [
+        "--allowlist-type", "Transaction",
+        "--allowlist-var", "TESTDATA_.*",
+    ],
+
+    shared_libs: [
+        "libbinder",
+        "libc++",
+    ],
+}
+
+rust_ffi_static {
+    name: "libbinder_rs_serialization_test",
+    crate_name: "binder_rs_serialization_test",
+    srcs: [
+        "serialization.rs",
+        ":libbinder_rs_serialization_bindgen",
+    ],
+    rustlibs: [
+        "libbinder_rs",
     ],
 }

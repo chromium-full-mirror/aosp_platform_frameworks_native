@@ -15,6 +15,23 @@
  */
 
 // TODO(b/31559095): bionic on host should define this
+package {
+    default_applicable_licenses: ["frameworks_native_libs_binder_ndk_license"],
+}
+
+// Added automatically by a large-scale-change
+// See: http://go/android-license-faq
+license {
+    name: "frameworks_native_libs_binder_ndk_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+    ],
+    license_text: [
+        "NOTICE",
+    ],
+}
+
 cc_defaults {
     name: "libbinder_ndk_host_user",
     target: {
@@ -38,7 +55,9 @@ cc_library {
     defaults: ["libbinder_ndk_host_user"],
     host_supported: true,
 
-    llndk_stubs: "libbinder_ndk.llndk",
+    llndk: {
+        symbol_file: "libbinder_ndk.map.txt",
+    },
 
     export_include_dirs: [
         "include_cpp",
@@ -104,16 +123,49 @@ cc_library {
         "--header-filter=^.*frameworks/native/libs/binder/.*.h$",
     ],
     tidy_checks_as_errors: [
-        "*",
+        // Explicitly list the checks that should not occur in this module.
+        "abseil-*",
+        "android-*",
+        "bugprone-*",
+        "cert-*",
+        "clang-analyzer-*",
         "-clang-analyzer-core.CallAndMessage",
         "-clang-analyzer-core.uninitialized.Assign",
-        "-clang-analyzer-unix.Malloc,",
+        "-clang-analyzer-unix.Malloc",
         "-clang-analyzer-deadcode.DeadStores",
         "-clang-analyzer-optin.cplusplus.UninitializedObject",
+        "google-*",
+        "-google-readability-*",
+        "-google-runtime-references",
+        "misc-*",
         "-misc-no-recursion",
+        "-misc-non-private-member-variables-in-classes",
         "-misc-redundant-expression",
+        "-misc-unused-parameters",
         "-misc-unused-using-decls",
+        "performance*",
+        "portability*",
     ],
+}
+
+cc_library_headers {
+    name: "libbinder_headers_platform_shared",
+    export_include_dirs: ["include_cpp"],
+    vendor_available: true,
+    host_supported: true,
+    // TODO(b/153609531): remove when no longer needed.
+    native_bridge_supported: true,
+    target: {
+        darwin: {
+            enabled: false,
+        },
+    },
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media",
+        "com.android.media.swcodec",
+    ],
+    min_sdk_version: "29",
 }
 
 ndk_headers {
@@ -141,14 +193,4 @@ ndk_library {
     name: "libbinder_ndk",
     symbol_file: "libbinder_ndk.map.txt",
     first_version: "29",
-}
-
-llndk_library {
-    name: "libbinder_ndk.llndk",
-    symbol_file: "libbinder_ndk.map.txt",
-    export_include_dirs: [
-        "include_cpp",
-        "include_ndk",
-        "include_platform",
-    ],
 }

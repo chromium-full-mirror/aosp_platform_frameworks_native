@@ -905,6 +905,13 @@ void TouchInputMapper::configureSurface(nsecs_t when, bool* outResetNeeded) {
             mTiltXScale = M_PI / 180;
             mTiltYScale = M_PI / 180;
 
+            if (mRawPointerAxes.tiltX.resolution) {
+                mTiltXScale = 1.0 / mRawPointerAxes.tiltX.resolution;
+            }
+            if (mRawPointerAxes.tiltY.resolution) {
+                mTiltYScale = 1.0 / mRawPointerAxes.tiltY.resolution;
+            }
+
             mOrientedRanges.haveTilt = true;
 
             mOrientedRanges.tilt.axis = AMOTION_EVENT_AXIS_TILT;
@@ -3673,6 +3680,9 @@ void TouchInputMapper::rotateAndScale(float& x, float& y) {
     const float xScaled = float(x - mRawPointerAxes.x.minValue) * mXScale;
     const float yScaled = float(y - mRawPointerAxes.y.minValue) * mYScale;
 
+    const float xScaledMax = float(mRawPointerAxes.x.maxValue - x) * mXScale;
+    const float yScaledMax = float(mRawPointerAxes.y.maxValue - y) * mYScale;
+
     // Rotate to surface coordinate.
     // 0 - no swap and reverse.
     // 90 - swap x/y and reverse y.
@@ -3684,16 +3694,16 @@ void TouchInputMapper::rotateAndScale(float& x, float& y) {
             y = yScaled + mYTranslate;
             break;
         case DISPLAY_ORIENTATION_90:
-            y = mSurfaceRight - xScaled;
+            y = xScaledMax - (mRawSurfaceWidth - mSurfaceRight);
             x = yScaled + mYTranslate;
             break;
         case DISPLAY_ORIENTATION_180:
-            x = mSurfaceRight - xScaled;
-            y = mSurfaceBottom - yScaled;
+            x = xScaledMax - (mRawSurfaceWidth - mSurfaceRight);
+            y = yScaledMax - (mRawSurfaceHeight - mSurfaceBottom);
             break;
         case DISPLAY_ORIENTATION_270:
             y = xScaled + mXTranslate;
-            x = mSurfaceBottom - yScaled;
+            x = yScaledMax - (mRawSurfaceHeight - mSurfaceBottom);
             break;
         default:
             assert(false);

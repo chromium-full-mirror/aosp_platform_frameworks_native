@@ -15,7 +15,6 @@
  */
 
 #include "BufferedTextOutput.h"
-#include <binder/Debug.h>
 
 #include <cutils/atomic.h>
 #include <utils/Log.h>
@@ -26,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "Debug.h"
 #include "Static.h"
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ BufferedTextOutput::BufferState* BufferedTextOutput::getBuffer() const
         BufferState* bs = ts.states[mIndex].get();
         if (bs != nullptr && bs->seq == mSeq) return bs;
 
-        ts.states.editItemAt(mIndex) = new BufferState(mIndex);
+        ts.states.editItemAt(mIndex) = sp<BufferState>::make(mIndex);
         bs = ts.states[mIndex].get();
         if (bs != nullptr) return bs;
     }
