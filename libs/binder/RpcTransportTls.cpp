@@ -22,10 +22,12 @@
 #include <openssl/bn.h>
 #include <openssl/ssl.h>
 
+#include <binder/RpcTlsUtils.h>
 #include <binder/RpcTransportTls.h>
 
 #include "FdTrigger.h"
 #include "RpcState.h"
+#include "Utils.h"
 
 #define SHOULD_LOG_TLS_DETAIL false
 
@@ -35,22 +37,12 @@
 #define LOG_TLS_DETAIL(...) ALOGV(__VA_ARGS__) // for type checking
 #endif
 
-#define TEST_AND_RETURN(value, expr)            \
-    do {                                        \
-        if (!(expr)) {                          \
-            ALOGE("Failed to call: %s", #expr); \
-            return value;                       \
-        }                                       \
-    } while (0)
-
 using android::base::ErrnoError;
 using android::base::Error;
 using android::base::Result;
 
 namespace android {
 namespace {
-
-constexpr const int kCertValidDays = 30;
 
 // Implement BIO for socket that ignores SIGPIPE.
 int socketNew(BIO* bio) {
@@ -104,49 +96,6 @@ bssl::UniquePtr<BIO> newSocketBio(android::base::borrowed_fd fd) {
     BIO_set_data(ret.get(), reinterpret_cast<void*>(fd.get()));
     BIO_set_init(ret.get(), 1);
     return ret;
-}
-
-bssl::UniquePtr<EVP_PKEY> makeKeyPairForSelfSignedCert() {
-    bssl::UniquePtr<EC_KEY> ec_key(EC_KEY_new_by_curve_name(NID_X9_62_prime256v1));
-    if (ec_key == nullptr || !EC_KEY_generate_key(ec_key.get())) {
-        ALOGE("Failed to generate key pair.");
-        return nullptr;
-    }
-    bssl::UniquePtr<EVP_PKEY> evp_pkey(EVP_PKEY_new());
-    // Use set1 instead of assign to avoid leaking ec_key when assign fails. set1 increments
-    // the refcount of the ec_key, so it is okay to release it at the end of this function.
-    if (evp_pkey == nullptr || !EVP_PKEY_set1_EC_KEY(evp_pkey.get(), ec_key.get())) {
-        ALOGE("Failed to assign key pair.");
-        return nullptr;
-    }
-    return evp_pkey;
-}
-
-bssl::UniquePtr<X509> makeSelfSignedCert(EVP_PKEY* evp_pkey, const int valid_days) {
-    bssl::UniquePtr<X509> x509(X509_new());
-    bssl::UniquePtr<BIGNUM> serial(BN_new());
-    bssl::UniquePtr<BIGNUM> serialLimit(BN_new());
-    TEST_AND_RETURN(nullptr, BN_lshift(serialLimit.get(), BN_value_one(), 128));
-    TEST_AND_RETURN(nullptr, BN_rand_range(serial.get(), serialLimit.get()));
-    TEST_AND_RETURN(nullptr, BN_to_ASN1_INTEGER(serial.get(), X509_get_serialNumber(x509.get())));
-    TEST_AND_RETURN(nullptr, X509_gmtime_adj(X509_getm_notBefore(x509.get()), 0));
-    TEST_AND_RETURN(nullptr,
-                    X509_gmtime_adj(X509_getm_notAfter(x509.get()), 60 * 60 * 24 * valid_days));
-
-    X509_NAME* subject = X509_get_subject_name(x509.get());
-    TEST_AND_RETURN(nullptr,
-                    X509_NAME_add_entry_by_txt(subject, "O", MBSTRING_ASC,
-                                               reinterpret_cast<const uint8_t*>("Android"), -1, -1,
-                                               0));
-    TEST_AND_RETURN(nullptr,
-                    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-                                               reinterpret_cast<const uint8_t*>("BinderRPC"), -1,
-                                               -1, 0));
-    TEST_AND_RETURN(nullptr, X509_set_issuer_name(x509.get(), subject));
-
-    TEST_AND_RETURN(nullptr, X509_set_pubkey(x509.get(), evp_pkey));
-    TEST_AND_RETURN(nullptr, X509_sign(x509.get(), evp_pkey, EVP_sha256()));
-    return x509;
 }
 
 [[maybe_unused]] void sslDebugLog(const SSL* ssl, int type, int value) {
@@ -220,12 +169,13 @@ public:
     // If |sslError| is WANT_READ / WANT_WRITE, poll for POLLIN / POLLOUT respectively. Otherwise
     // return error. Also return error if |fdTrigger| is triggered before or during poll().
     status_t pollForSslError(android::base::borrowed_fd fd, int sslError, FdTrigger* fdTrigger,
-                             const char* fnString, int additionalEvent = 0) {
+                             const char* fnString, int additionalEvent,
+                             const std::function<status_t()>& altPoll) {
         switch (sslError) {
             case SSL_ERROR_WANT_READ:
-                return handlePoll(POLLIN | additionalEvent, fd, fdTrigger, fnString);
+                return handlePoll(POLLIN | additionalEvent, fd, fdTrigger, fnString, altPoll);
             case SSL_ERROR_WANT_WRITE:
-                return handlePoll(POLLOUT | additionalEvent, fd, fdTrigger, fnString);
+                return handlePoll(POLLOUT | additionalEvent, fd, fdTrigger, fnString, altPoll);
             case SSL_ERROR_SYSCALL: {
                 auto queue = toString();
                 LOG_TLS_DETAIL("%s(): %s. Treating as DEAD_OBJECT. Error queue: %s", fnString,
@@ -245,11 +195,17 @@ private:
     bool mHandled = false;
 
     status_t handlePoll(int event, android::base::borrowed_fd fd, FdTrigger* fdTrigger,
-                        const char* fnString) {
-        status_t ret = fdTrigger->triggerablePoll(fd, event);
-        if (ret != OK && ret != DEAD_OBJECT && ret != -ECANCELED) {
-            ALOGE("triggerablePoll error while poll()-ing after %s(): %s", fnString,
-                  statusToString(ret).c_str());
+                        const char* fnString, const std::function<status_t()>& altPoll) {
+        status_t ret;
+        if (altPoll) {
+            ret = altPoll();
+            if (fdTrigger->isTriggered()) ret = DEAD_OBJECT;
+        } else {
+            ret = fdTrigger->triggerablePoll(fd, event);
+        }
+
+        if (ret != OK && ret != DEAD_OBJECT) {
+            ALOGE("poll error while after %s(): %s", fnString, statusToString(ret).c_str());
         }
         clear();
         return ret;
@@ -319,14 +275,14 @@ public:
     RpcTransportTls(android::base::unique_fd socket, Ssl ssl)
           : mSocket(std::move(socket)), mSsl(std::move(ssl)) {}
     Result<size_t> peek(void* buf, size_t size) override;
-    status_t interruptableWriteFully(FdTrigger* fdTrigger, const void* data, size_t size) override;
-    status_t interruptableReadFully(FdTrigger* fdTrigger, void* data, size_t size) override;
+    status_t interruptableWriteFully(FdTrigger* fdTrigger, iovec* iovs, int niovs,
+                                     const std::function<status_t()>& altPoll) override;
+    status_t interruptableReadFully(FdTrigger* fdTrigger, iovec* iovs, int niovs,
+                                    const std::function<status_t()>& altPoll) override;
 
 private:
     android::base::unique_fd mSocket;
     Ssl mSsl;
-
-    static status_t isTriggered(FdTrigger* fdTrigger);
 };
 
 // Error code is errno.
@@ -347,75 +303,87 @@ Result<size_t> RpcTransportTls::peek(void* buf, size_t size) {
     return ret;
 }
 
-status_t RpcTransportTls::isTriggered(FdTrigger* fdTrigger) {
-    auto ret = fdTrigger->isTriggeredPolled();
-    if (!ret.ok()) {
-        ALOGE("%s: %s", __PRETTY_FUNCTION__, ret.error().message().c_str());
-        return ret.error().code() == 0 ? UNKNOWN_ERROR : -ret.error().code();
-    }
-    return OK;
-}
-
-status_t RpcTransportTls::interruptableWriteFully(FdTrigger* fdTrigger, const void* data,
-                                                  size_t size) {
-    auto buffer = reinterpret_cast<const uint8_t*>(data);
-    const uint8_t* end = buffer + size;
-
+status_t RpcTransportTls::interruptableWriteFully(FdTrigger* fdTrigger, iovec* iovs, int niovs,
+                                                  const std::function<status_t()>& altPoll) {
     MAYBE_WAIT_IN_FLAKE_MODE;
+
+    if (niovs < 0) return BAD_VALUE;
 
     // Before doing any I/O, check trigger once. This ensures the trigger is checked at least
     // once. The trigger is also checked via triggerablePoll() after every SSL_write().
-    if (status_t status = isTriggered(fdTrigger); status != OK) return status;
+    if (fdTrigger->isTriggered()) return DEAD_OBJECT;
 
-    while (buffer < end) {
-        size_t todo = std::min<size_t>(end - buffer, std::numeric_limits<int>::max());
-        auto [writeSize, errorQueue] = mSsl.call(SSL_write, buffer, todo);
-        if (writeSize > 0) {
-            buffer += writeSize;
-            errorQueue.clear();
+    size_t size = 0;
+    for (int i = 0; i < niovs; i++) {
+        const iovec& iov = iovs[i];
+        if (iov.iov_len == 0) {
             continue;
         }
-        // SSL_write() should never return 0 unless BIO_write were to return 0.
-        int sslError = mSsl.getError(writeSize);
-        // TODO(b/195788248): BIO should contain the FdTrigger, and send(2) / recv(2) should be
-        //   triggerablePoll()-ed. Then additionalEvent is no longer necessary.
-        status_t pollStatus =
-                errorQueue.pollForSslError(mSocket.get(), sslError, fdTrigger, "SSL_write", POLLIN);
-        if (pollStatus != OK) return pollStatus;
-        // Do not advance buffer. Try SSL_write() again.
+        size += iov.iov_len;
+
+        auto buffer = reinterpret_cast<const uint8_t*>(iov.iov_base);
+        const uint8_t* end = buffer + iov.iov_len;
+        while (buffer < end) {
+            size_t todo = std::min<size_t>(end - buffer, std::numeric_limits<int>::max());
+            auto [writeSize, errorQueue] = mSsl.call(SSL_write, buffer, todo);
+            if (writeSize > 0) {
+                buffer += writeSize;
+                errorQueue.clear();
+                continue;
+            }
+            // SSL_write() should never return 0 unless BIO_write were to return 0.
+            int sslError = mSsl.getError(writeSize);
+            // TODO(b/195788248): BIO should contain the FdTrigger, and send(2) / recv(2) should be
+            //   triggerablePoll()-ed. Then additionalEvent is no longer necessary.
+            status_t pollStatus = errorQueue.pollForSslError(mSocket.get(), sslError, fdTrigger,
+                                                             "SSL_write", POLLIN, altPoll);
+            if (pollStatus != OK) return pollStatus;
+            // Do not advance buffer. Try SSL_write() again.
+        }
     }
     LOG_TLS_DETAIL("TLS: Sent %zu bytes!", size);
     return OK;
 }
 
-status_t RpcTransportTls::interruptableReadFully(FdTrigger* fdTrigger, void* data, size_t size) {
-    auto buffer = reinterpret_cast<uint8_t*>(data);
-    uint8_t* end = buffer + size;
-
+status_t RpcTransportTls::interruptableReadFully(FdTrigger* fdTrigger, iovec* iovs, int niovs,
+                                                 const std::function<status_t()>& altPoll) {
     MAYBE_WAIT_IN_FLAKE_MODE;
+
+    if (niovs < 0) return BAD_VALUE;
 
     // Before doing any I/O, check trigger once. This ensures the trigger is checked at least
     // once. The trigger is also checked via triggerablePoll() after every SSL_write().
-    if (status_t status = isTriggered(fdTrigger); status != OK) return status;
+    if (fdTrigger->isTriggered()) return DEAD_OBJECT;
 
-    while (buffer < end) {
-        size_t todo = std::min<size_t>(end - buffer, std::numeric_limits<int>::max());
-        auto [readSize, errorQueue] = mSsl.call(SSL_read, buffer, todo);
-        if (readSize > 0) {
-            buffer += readSize;
-            errorQueue.clear();
+    size_t size = 0;
+    for (int i = 0; i < niovs; i++) {
+        const iovec& iov = iovs[i];
+        if (iov.iov_len == 0) {
             continue;
         }
-        if (readSize == 0) {
-            // SSL_read() only returns 0 on EOF.
-            errorQueue.clear();
-            return DEAD_OBJECT;
+        size += iov.iov_len;
+
+        auto buffer = reinterpret_cast<uint8_t*>(iov.iov_base);
+        const uint8_t* end = buffer + iov.iov_len;
+        while (buffer < end) {
+            size_t todo = std::min<size_t>(end - buffer, std::numeric_limits<int>::max());
+            auto [readSize, errorQueue] = mSsl.call(SSL_read, buffer, todo);
+            if (readSize > 0) {
+                buffer += readSize;
+                errorQueue.clear();
+                continue;
+            }
+            if (readSize == 0) {
+                // SSL_read() only returns 0 on EOF.
+                errorQueue.clear();
+                return DEAD_OBJECT;
+            }
+            int sslError = mSsl.getError(readSize);
+            status_t pollStatus = errorQueue.pollForSslError(mSocket.get(), sslError, fdTrigger,
+                                                             "SSL_read", 0, altPoll);
+            if (pollStatus != OK) return pollStatus;
+            // Do not advance buffer. Try SSL_read() again.
         }
-        int sslError = mSsl.getError(readSize);
-        status_t pollStatus =
-                errorQueue.pollForSslError(mSocket.get(), sslError, fdTrigger, "SSL_read");
-        if (pollStatus != OK) return pollStatus;
-        // Do not advance buffer. Try SSL_read() again.
     }
     LOG_TLS_DETAIL("TLS: Received %zu bytes!", size);
     return OK;
@@ -444,7 +412,7 @@ bool setFdAndDoHandshake(Ssl* ssl, android::base::borrowed_fd fd, FdTrigger* fdT
         }
         int sslError = ssl->getError(ret);
         status_t pollStatus =
-                errorQueue.pollForSslError(fd, sslError, fdTrigger, "SSL_do_handshake");
+                errorQueue.pollForSslError(fd, sslError, fdTrigger, "SSL_do_handshake", 0, {});
         if (pollStatus != OK) return false;
     }
 }
@@ -453,45 +421,63 @@ class RpcTransportCtxTls : public RpcTransportCtx {
 public:
     template <typename Impl,
               typename = std::enable_if_t<std::is_base_of_v<RpcTransportCtxTls, Impl>>>
-    static std::unique_ptr<RpcTransportCtxTls> create();
+    static std::unique_ptr<RpcTransportCtxTls> create(
+            std::shared_ptr<RpcCertificateVerifier> verifier, RpcAuth* auth);
     std::unique_ptr<RpcTransport> newTransport(android::base::unique_fd fd,
                                                FdTrigger* fdTrigger) const override;
-    std::string getCertificate(CertificateFormat) const override;
-    status_t addTrustedPeerCertificate(CertificateFormat, std::string_view cert) override;
+    std::vector<uint8_t> getCertificate(RpcCertificateFormat) const override;
 
 protected:
+    static ssl_verify_result_t sslCustomVerify(SSL* ssl, uint8_t* outAlert);
     virtual void preHandshake(Ssl* ssl) const = 0;
     bssl::UniquePtr<SSL_CTX> mCtx;
+    std::shared_ptr<RpcCertificateVerifier> mCertVerifier;
 };
 
-std::string RpcTransportCtxTls::getCertificate(CertificateFormat) const {
-    // TODO(b/195166979): return certificate here
-    return {};
+std::vector<uint8_t> RpcTransportCtxTls::getCertificate(RpcCertificateFormat format) const {
+    X509* x509 = SSL_CTX_get0_certificate(mCtx.get()); // does not own
+    return serializeCertificate(x509, format);
 }
 
-status_t RpcTransportCtxTls::addTrustedPeerCertificate(CertificateFormat, std::string_view) {
-    // TODO(b/195166979): set certificate here
-    return OK;
+// Verify by comparing the leaf of peer certificate with every certificate in
+// mTrustedPeerCertificates. Does not support certificate chains.
+ssl_verify_result_t RpcTransportCtxTls::sslCustomVerify(SSL* ssl, uint8_t* outAlert) {
+    LOG_ALWAYS_FATAL_IF(outAlert == nullptr);
+    const char* logPrefix = SSL_is_server(ssl) ? "Server" : "Client";
+
+    auto ctx = SSL_get_SSL_CTX(ssl); // Does not set error queue
+    LOG_ALWAYS_FATAL_IF(ctx == nullptr);
+    // void* -> RpcTransportCtxTls*
+    auto rpcTransportCtxTls = reinterpret_cast<RpcTransportCtxTls*>(SSL_CTX_get_app_data(ctx));
+    LOG_ALWAYS_FATAL_IF(rpcTransportCtxTls == nullptr);
+
+    status_t verifyStatus = rpcTransportCtxTls->mCertVerifier->verify(ssl, outAlert);
+    if (verifyStatus == OK) {
+        return ssl_verify_ok;
+    }
+    LOG_TLS_DETAIL("%s: Failed to verify client: status = %s, alert = %s", logPrefix,
+                   statusToString(verifyStatus).c_str(), SSL_alert_desc_string_long(*outAlert));
+    return ssl_verify_invalid;
 }
 
 // Common implementation for creating server and client contexts. The child class, |Impl|, is
 // provided as a template argument so that this function can initialize an |Impl| object.
 template <typename Impl, typename>
-std::unique_ptr<RpcTransportCtxTls> RpcTransportCtxTls::create() {
+std::unique_ptr<RpcTransportCtxTls> RpcTransportCtxTls::create(
+        std::shared_ptr<RpcCertificateVerifier> verifier, RpcAuth* auth) {
     bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
     TEST_AND_RETURN(nullptr, ctx != nullptr);
 
-    auto evp_pkey = makeKeyPairForSelfSignedCert();
-    TEST_AND_RETURN(nullptr, evp_pkey != nullptr);
-    auto cert = makeSelfSignedCert(evp_pkey.get(), kCertValidDays);
-    TEST_AND_RETURN(nullptr, cert != nullptr);
-    TEST_AND_RETURN(nullptr, SSL_CTX_use_PrivateKey(ctx.get(), evp_pkey.get()));
-    TEST_AND_RETURN(nullptr, SSL_CTX_use_certificate(ctx.get(), cert.get()));
+    if (status_t authStatus = auth->configure(ctx.get()); authStatus != OK) {
+        ALOGE("%s: Failed to configure auth info: %s", __PRETTY_FUNCTION__,
+              statusToString(authStatus).c_str());
+        return nullptr;
+    };
 
-    // TODO(b/195166979): peer should send certificate in a different channel, and this class
-    //  should verify it here.
-    SSL_CTX_set_custom_verify(ctx.get(), SSL_VERIFY_PEER,
-                              [](SSL*, uint8_t*) -> ssl_verify_result_t { return ssl_verify_ok; });
+    // Enable two-way authentication by setting SSL_VERIFY_FAIL_IF_NO_PEER_CERT on server.
+    // Client ignores SSL_VERIFY_FAIL_IF_NO_PEER_CERT flag.
+    SSL_CTX_set_custom_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                              sslCustomVerify);
 
     // Require at least TLS 1.3
     TEST_AND_RETURN(nullptr, SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION));
@@ -501,7 +487,10 @@ std::unique_ptr<RpcTransportCtxTls> RpcTransportCtxTls::create() {
     }
 
     auto ret = std::make_unique<Impl>();
+    // RpcTransportCtxTls* -> void*
+    TEST_AND_RETURN(nullptr, SSL_CTX_set_app_data(ctx.get(), reinterpret_cast<void*>(ret.get())));
     ret->mCtx = std::move(ctx);
+    ret->mCertVerifier = std::move(verifier);
     return ret;
 }
 
@@ -533,19 +522,31 @@ protected:
 } // namespace
 
 std::unique_ptr<RpcTransportCtx> RpcTransportCtxFactoryTls::newServerCtx() const {
-    return android::RpcTransportCtxTls::create<RpcTransportCtxTlsServer>();
+    return android::RpcTransportCtxTls::create<RpcTransportCtxTlsServer>(mCertVerifier,
+                                                                         mAuth.get());
 }
 
 std::unique_ptr<RpcTransportCtx> RpcTransportCtxFactoryTls::newClientCtx() const {
-    return android::RpcTransportCtxTls::create<RpcTransportCtxTlsClient>();
+    return android::RpcTransportCtxTls::create<RpcTransportCtxTlsClient>(mCertVerifier,
+                                                                         mAuth.get());
 }
 
 const char* RpcTransportCtxFactoryTls::toCString() const {
     return "tls";
 }
 
-std::unique_ptr<RpcTransportCtxFactory> RpcTransportCtxFactoryTls::make() {
-    return std::unique_ptr<RpcTransportCtxFactoryTls>(new RpcTransportCtxFactoryTls());
+std::unique_ptr<RpcTransportCtxFactory> RpcTransportCtxFactoryTls::make(
+        std::shared_ptr<RpcCertificateVerifier> verifier, std::unique_ptr<RpcAuth> auth) {
+    if (verifier == nullptr) {
+        ALOGE("%s: Must provide a certificate verifier", __PRETTY_FUNCTION__);
+        return nullptr;
+    }
+    if (auth == nullptr) {
+        ALOGE("%s: Must provide an auth provider", __PRETTY_FUNCTION__);
+        return nullptr;
+    }
+    return std::unique_ptr<RpcTransportCtxFactoryTls>(
+            new RpcTransportCtxFactoryTls(std::move(verifier), std::move(auth)));
 }
 
 } // namespace android

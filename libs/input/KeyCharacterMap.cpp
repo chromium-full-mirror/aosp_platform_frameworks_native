@@ -19,19 +19,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef __ANDROID__
+#ifdef __linux__
 #include <binder/Parcel.h>
 #endif
-
 #include <android/keycodes.h>
+#include <attestation/HmacKeyManager.h>
 #include <input/InputEventLabels.h>
-#include <input/Keyboard.h>
 #include <input/KeyCharacterMap.h>
+#include <input/Keyboard.h>
 
-#include <utils/Log.h>
+#include <gui/constants.h>
 #include <utils/Errors.h>
-#include <utils/Tokenizer.h>
+#include <utils/Log.h>
 #include <utils/Timers.h>
+#include <utils/Tokenizer.h>
 
 // Enables debug output for the parser.
 #define DEBUG_PARSER 0
@@ -85,123 +86,196 @@ static String8 toString(const char16_t* chars, size_t numChars) {
 
 // --- KeyCharacterMap ---
 
-sp<KeyCharacterMap> KeyCharacterMap::sEmpty = new KeyCharacterMap();
+KeyCharacterMap::KeyCharacterMap(const std::string& filename)
+      : mType(KeyboardType::UNKNOWN), mLoadFileName(filename) {}
 
-KeyCharacterMap::KeyCharacterMap() :
-    mType(KEYBOARD_TYPE_UNKNOWN) {
-}
-
-KeyCharacterMap::KeyCharacterMap(const KeyCharacterMap& other) :
-    RefBase(), mType(other.mType), mKeysByScanCode(other.mKeysByScanCode),
-    mKeysByUsageCode(other.mKeysByUsageCode) {
+KeyCharacterMap::KeyCharacterMap(const KeyCharacterMap& other)
+      : mType(other.mType),
+        mLoadFileName(other.mLoadFileName),
+        mLayoutOverlayApplied(other.mLayoutOverlayApplied),
+        mKeysByScanCode(other.mKeysByScanCode),
+        mKeysByUsageCode(other.mKeysByUsageCode) {
     for (size_t i = 0; i < other.mKeys.size(); i++) {
         mKeys.add(other.mKeys.keyAt(i), new Key(*other.mKeys.valueAt(i)));
     }
 }
 
 KeyCharacterMap::~KeyCharacterMap() {
-    for (size_t i = 0; i < mKeys.size(); i++) {
-        Key* key = mKeys.editValueAt(i);
-        delete key;
-    }
+    clear();
 }
 
-status_t KeyCharacterMap::load(const std::string& filename,
-        Format format, sp<KeyCharacterMap>* outMap) {
-    outMap->clear();
+bool KeyCharacterMap::operator==(const KeyCharacterMap& other) const {
+    if (mType != other.mType) {
+        return false;
+    }
+    if (mLoadFileName != other.mLoadFileName) {
+        return false;
+    }
+    if (mLayoutOverlayApplied != other.mLayoutOverlayApplied) {
+        return false;
+    }
+    if (mKeys.size() != other.mKeys.size() ||
+        mKeysByScanCode.size() != other.mKeysByScanCode.size() ||
+        mKeysByUsageCode.size() != other.mKeysByUsageCode.size()) {
+        return false;
+    }
 
+    for (size_t i = 0; i < mKeys.size(); i++) {
+        if (mKeys.keyAt(i) != other.mKeys.keyAt(i)) {
+            return false;
+        }
+        const Key* key = mKeys.valueAt(i);
+        const Key* otherKey = other.mKeys.valueAt(i);
+        if (key->label != otherKey->label || key->number != otherKey->number) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < mKeysByScanCode.size(); i++) {
+        if (mKeysByScanCode.keyAt(i) != other.mKeysByScanCode.keyAt(i)) {
+            return false;
+        }
+        if (mKeysByScanCode.valueAt(i) != other.mKeysByScanCode.valueAt(i)) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < mKeysByUsageCode.size(); i++) {
+        if (mKeysByUsageCode.keyAt(i) != other.mKeysByUsageCode.keyAt(i)) {
+            return false;
+        }
+        if (mKeysByUsageCode.valueAt(i) != other.mKeysByUsageCode.valueAt(i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool KeyCharacterMap::operator!=(const KeyCharacterMap& other) const {
+    return !(*this == other);
+}
+
+base::Result<std::shared_ptr<KeyCharacterMap>> KeyCharacterMap::load(const std::string& filename,
+                                                                     Format format) {
     Tokenizer* tokenizer;
     status_t status = Tokenizer::open(String8(filename.c_str()), &tokenizer);
     if (status) {
-        ALOGE("Error %d opening key character map file %s.", status, filename.c_str());
-    } else {
-        status = load(tokenizer, format, outMap);
-        delete tokenizer;
+        return Errorf("Error {} opening key character map file {}.", status, filename.c_str());
     }
-    return status;
+    std::shared_ptr<KeyCharacterMap> map =
+            std::shared_ptr<KeyCharacterMap>(new KeyCharacterMap(filename));
+    if (!map.get()) {
+        ALOGE("Error allocating key character map.");
+        return Errorf("Error allocating key character map.");
+    }
+    std::unique_ptr<Tokenizer> t(tokenizer);
+    status = map->load(t.get(), format);
+    if (status == OK) {
+        return map;
+    }
+    return Errorf("Load KeyCharacterMap failed {}.", status);
 }
 
-status_t KeyCharacterMap::loadContents(const std::string& filename, const char* contents,
-        Format format, sp<KeyCharacterMap>* outMap) {
-    outMap->clear();
-
+base::Result<std::shared_ptr<KeyCharacterMap>> KeyCharacterMap::loadContents(
+        const std::string& filename, const char* contents, Format format) {
     Tokenizer* tokenizer;
     status_t status = Tokenizer::fromContents(String8(filename.c_str()), contents, &tokenizer);
     if (status) {
         ALOGE("Error %d opening key character map.", status);
-    } else {
-        status = load(tokenizer, format, outMap);
-        delete tokenizer;
+        return Errorf("Error {} opening key character map.", status);
     }
-    return status;
-}
-
-status_t KeyCharacterMap::load(Tokenizer* tokenizer,
-        Format format, sp<KeyCharacterMap>* outMap) {
-    status_t status = OK;
-    sp<KeyCharacterMap> map = new KeyCharacterMap();
+    std::shared_ptr<KeyCharacterMap> map =
+            std::shared_ptr<KeyCharacterMap>(new KeyCharacterMap(filename));
     if (!map.get()) {
         ALOGE("Error allocating key character map.");
-        status = NO_MEMORY;
-    } else {
+        return Errorf("Error allocating key character map.");
+    }
+    std::unique_ptr<Tokenizer> t(tokenizer);
+    status = map->load(t.get(), format);
+    if (status == OK) {
+        return map;
+    }
+    return Errorf("Load KeyCharacterMap failed {}.", status);
+}
+
+status_t KeyCharacterMap::load(Tokenizer* tokenizer, Format format) {
+    status_t status = OK;
 #if DEBUG_PARSER_PERFORMANCE
-        nsecs_t startTime = systemTime(SYSTEM_TIME_MONOTONIC);
+    nsecs_t startTime = systemTime(SYSTEM_TIME_MONOTONIC);
 #endif
-        Parser parser(map.get(), tokenizer, format);
-        status = parser.parse();
+    Parser parser(this, tokenizer, format);
+    status = parser.parse();
 #if DEBUG_PARSER_PERFORMANCE
-        nsecs_t elapsedTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
-        ALOGD("Parsed key character map file '%s' %d lines in %0.3fms.",
-                tokenizer->getFilename().string(), tokenizer->getLineNumber(),
-                elapsedTime / 1000000.0);
+    nsecs_t elapsedTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+    ALOGD("Parsed key character map file '%s' %d lines in %0.3fms.",
+          tokenizer->getFilename().string(), tokenizer->getLineNumber(), elapsedTime / 1000000.0);
 #endif
-        if (!status) {
-            *outMap = map;
-        }
+    if (status != OK) {
+        ALOGE("Loading KeyCharacterMap failed with status %s", statusToString(status).c_str());
     }
     return status;
 }
 
-sp<KeyCharacterMap> KeyCharacterMap::combine(const sp<KeyCharacterMap>& base,
-        const sp<KeyCharacterMap>& overlay) {
-    if (overlay == nullptr) {
-        return base;
+void KeyCharacterMap::clear() {
+    mKeysByScanCode.clear();
+    mKeysByUsageCode.clear();
+    for (size_t i = 0; i < mKeys.size(); i++) {
+        Key* key = mKeys.editValueAt(i);
+        delete key;
     }
-    if (base == nullptr) {
-        return overlay;
-    }
+    mKeys.clear();
+    mLayoutOverlayApplied = false;
+    mType = KeyboardType::UNKNOWN;
+}
 
-    sp<KeyCharacterMap> map = new KeyCharacterMap(*base.get());
-    for (size_t i = 0; i < overlay->mKeys.size(); i++) {
-        int32_t keyCode = overlay->mKeys.keyAt(i);
-        Key* key = overlay->mKeys.valueAt(i);
-        ssize_t oldIndex = map->mKeys.indexOfKey(keyCode);
+status_t KeyCharacterMap::reloadBaseFromFile() {
+    clear();
+    Tokenizer* tokenizer;
+    status_t status = Tokenizer::open(String8(mLoadFileName.c_str()), &tokenizer);
+    if (status) {
+        ALOGE("Error %s opening key character map file %s.", statusToString(status).c_str(),
+              mLoadFileName.c_str());
+        return status;
+    }
+    std::unique_ptr<Tokenizer> t(tokenizer);
+    return load(t.get(), KeyCharacterMap::Format::BASE);
+}
+
+void KeyCharacterMap::combine(const KeyCharacterMap& overlay) {
+    if (mLayoutOverlayApplied) {
+        reloadBaseFromFile();
+    }
+    for (size_t i = 0; i < overlay.mKeys.size(); i++) {
+        int32_t keyCode = overlay.mKeys.keyAt(i);
+        Key* key = overlay.mKeys.valueAt(i);
+        ssize_t oldIndex = mKeys.indexOfKey(keyCode);
         if (oldIndex >= 0) {
-            delete map->mKeys.valueAt(oldIndex);
-            map->mKeys.editValueAt(oldIndex) = new Key(*key);
+            delete mKeys.valueAt(oldIndex);
+            mKeys.editValueAt(oldIndex) = new Key(*key);
         } else {
-            map->mKeys.add(keyCode, new Key(*key));
+            mKeys.add(keyCode, new Key(*key));
         }
     }
 
-    for (size_t i = 0; i < overlay->mKeysByScanCode.size(); i++) {
-        map->mKeysByScanCode.replaceValueFor(overlay->mKeysByScanCode.keyAt(i),
-                overlay->mKeysByScanCode.valueAt(i));
+    for (size_t i = 0; i < overlay.mKeysByScanCode.size(); i++) {
+        mKeysByScanCode.replaceValueFor(overlay.mKeysByScanCode.keyAt(i),
+                                        overlay.mKeysByScanCode.valueAt(i));
     }
 
-    for (size_t i = 0; i < overlay->mKeysByUsageCode.size(); i++) {
-        map->mKeysByUsageCode.replaceValueFor(overlay->mKeysByUsageCode.keyAt(i),
-                overlay->mKeysByUsageCode.valueAt(i));
+    for (size_t i = 0; i < overlay.mKeysByUsageCode.size(); i++) {
+        mKeysByUsageCode.replaceValueFor(overlay.mKeysByUsageCode.keyAt(i),
+                                         overlay.mKeysByUsageCode.valueAt(i));
     }
-    return map;
+    mLayoutOverlayApplied = true;
 }
 
-sp<KeyCharacterMap> KeyCharacterMap::empty() {
-    return sEmpty;
-}
-
-int32_t KeyCharacterMap::getKeyboardType() const {
+KeyCharacterMap::KeyboardType KeyCharacterMap::getKeyboardType() const {
     return mType;
+}
+
+const std::string KeyCharacterMap::getLoadFileName() const {
+    return mLoadFileName;
 }
 
 char16_t KeyCharacterMap::getDisplayLabel(int32_t keyCode) const {
@@ -599,10 +673,17 @@ void KeyCharacterMap::addLockedMetaKey(Vector<KeyEvent>& outEvents,
     }
 }
 
-#ifdef __ANDROID__
-sp<KeyCharacterMap> KeyCharacterMap::readFromParcel(Parcel* parcel) {
-    sp<KeyCharacterMap> map = new KeyCharacterMap();
-    map->mType = parcel->readInt32();
+#ifdef __linux__
+std::shared_ptr<KeyCharacterMap> KeyCharacterMap::readFromParcel(Parcel* parcel) {
+    if (parcel == nullptr) {
+        ALOGE("%s: Null parcel", __func__);
+        return nullptr;
+    }
+    std::string loadFileName = parcel->readCString();
+    std::shared_ptr<KeyCharacterMap> map =
+            std::shared_ptr<KeyCharacterMap>(new KeyCharacterMap(loadFileName));
+    map->mType = static_cast<KeyCharacterMap::KeyboardType>(parcel->readInt32());
+    map->mLayoutOverlayApplied = parcel->readBool();
     size_t numKeys = parcel->readInt32();
     if (parcel->errorCheck()) {
         return nullptr;
@@ -652,11 +733,41 @@ sp<KeyCharacterMap> KeyCharacterMap::readFromParcel(Parcel* parcel) {
             return nullptr;
         }
     }
+    size_t numKeysByScanCode = parcel->readInt32();
+    if (parcel->errorCheck()) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < numKeysByScanCode; i++) {
+        int32_t key = parcel->readInt32();
+        int32_t value = parcel->readInt32();
+        map->mKeysByScanCode.add(key, value);
+        if (parcel->errorCheck()) {
+            return nullptr;
+        }
+    }
+    size_t numKeysByUsageCode = parcel->readInt32();
+    if (parcel->errorCheck()) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < numKeysByUsageCode; i++) {
+        int32_t key = parcel->readInt32();
+        int32_t value = parcel->readInt32();
+        map->mKeysByUsageCode.add(key, value);
+        if (parcel->errorCheck()) {
+            return nullptr;
+        }
+    }
     return map;
 }
 
 void KeyCharacterMap::writeToParcel(Parcel* parcel) const {
-    parcel->writeInt32(mType);
+    if (parcel == nullptr) {
+        ALOGE("%s: Null parcel", __func__);
+        return;
+    }
+    parcel->writeCString(mLoadFileName.c_str());
+    parcel->writeInt32(static_cast<int32_t>(mType));
+    parcel->writeBool(mLayoutOverlayApplied);
 
     size_t numKeys = mKeys.size();
     parcel->writeInt32(numKeys);
@@ -676,9 +787,20 @@ void KeyCharacterMap::writeToParcel(Parcel* parcel) const {
         }
         parcel->writeInt32(0);
     }
+    size_t numKeysByScanCode = mKeysByScanCode.size();
+    parcel->writeInt32(numKeysByScanCode);
+    for (size_t i = 0; i < numKeysByScanCode; i++) {
+        parcel->writeInt32(mKeysByScanCode.keyAt(i));
+        parcel->writeInt32(mKeysByScanCode.valueAt(i));
+    }
+    size_t numKeysByUsageCode = mKeysByUsageCode.size();
+    parcel->writeInt32(numKeysByUsageCode);
+    for (size_t i = 0; i < numKeysByUsageCode; i++) {
+        parcel->writeInt32(mKeysByUsageCode.keyAt(i));
+        parcel->writeInt32(mKeysByUsageCode.valueAt(i));
+    }
 }
-#endif
-
+#endif // __linux__
 
 // --- KeyCharacterMap::Key ---
 
@@ -782,20 +904,20 @@ status_t KeyCharacterMap::Parser::parse() {
         return BAD_VALUE;
     }
 
-    if (mMap->mType == KEYBOARD_TYPE_UNKNOWN) {
+    if (mMap->mType == KeyboardType::UNKNOWN) {
         ALOGE("%s: Keyboard layout missing required keyboard 'type' declaration.",
                 mTokenizer->getLocation().string());
         return BAD_VALUE;
     }
 
-    if (mFormat == FORMAT_BASE) {
-        if (mMap->mType == KEYBOARD_TYPE_OVERLAY) {
+    if (mFormat == Format::BASE) {
+        if (mMap->mType == KeyboardType::OVERLAY) {
             ALOGE("%s: Base keyboard layout must specify a keyboard 'type' other than 'OVERLAY'.",
                     mTokenizer->getLocation().string());
             return BAD_VALUE;
         }
-    } else if (mFormat == FORMAT_OVERLAY) {
-        if (mMap->mType != KEYBOARD_TYPE_OVERLAY) {
+    } else if (mFormat == Format::OVERLAY) {
+        if (mMap->mType != KeyboardType::OVERLAY) {
             ALOGE("%s: Overlay keyboard layout missing required keyboard "
                     "'type OVERLAY' declaration.",
                     mTokenizer->getLocation().string());
@@ -807,7 +929,7 @@ status_t KeyCharacterMap::Parser::parse() {
 }
 
 status_t KeyCharacterMap::Parser::parseType() {
-    if (mMap->mType != KEYBOARD_TYPE_UNKNOWN) {
+    if (mMap->mType != KeyboardType::UNKNOWN) {
         ALOGE("%s: Duplicate keyboard 'type' declaration.",
                 mTokenizer->getLocation().string());
         return BAD_VALUE;
@@ -816,20 +938,20 @@ status_t KeyCharacterMap::Parser::parseType() {
     KeyboardType type;
     String8 typeToken = mTokenizer->nextToken(WHITESPACE);
     if (typeToken == "NUMERIC") {
-        type = KEYBOARD_TYPE_NUMERIC;
+        type = KeyboardType::NUMERIC;
     } else if (typeToken == "PREDICTIVE") {
-        type = KEYBOARD_TYPE_PREDICTIVE;
+        type = KeyboardType::PREDICTIVE;
     } else if (typeToken == "ALPHA") {
-        type = KEYBOARD_TYPE_ALPHA;
+        type = KeyboardType::ALPHA;
     } else if (typeToken == "FULL") {
-        type = KEYBOARD_TYPE_FULL;
+        type = KeyboardType::FULL;
     } else if (typeToken == "SPECIAL_FUNCTION") {
         ALOGW("The SPECIAL_FUNCTION type is now declared in the device's IDC file, please set "
                 "the property 'keyboard.specialFunction' to '1' there instead.");
         // TODO: return BAD_VALUE here in Q
-        type = KEYBOARD_TYPE_SPECIAL_FUNCTION;
+        type = KeyboardType::SPECIAL_FUNCTION;
     } else if (typeToken == "OVERLAY") {
-        type = KEYBOARD_TYPE_OVERLAY;
+        type = KeyboardType::OVERLAY;
     } else {
         ALOGE("%s: Expected keyboard type label, got '%s'.", mTokenizer->getLocation().string(),
                 typeToken.string());
@@ -880,7 +1002,7 @@ status_t KeyCharacterMap::Parser::parseMapKey() {
 
     mTokenizer->skipDelimiters(WHITESPACE);
     String8 keyCodeToken = mTokenizer->nextToken(WHITESPACE);
-    int32_t keyCode = getKeyCodeByLabel(keyCodeToken.string());
+    int32_t keyCode = InputEventLookup::getKeyCodeByLabel(keyCodeToken.string());
     if (!keyCode) {
         ALOGE("%s: Expected key code label, got '%s'.", mTokenizer->getLocation().string(),
                 keyCodeToken.string());
@@ -897,7 +1019,7 @@ status_t KeyCharacterMap::Parser::parseMapKey() {
 
 status_t KeyCharacterMap::Parser::parseKey() {
     String8 keyCodeToken = mTokenizer->nextToken(WHITESPACE);
-    int32_t keyCode = getKeyCodeByLabel(keyCodeToken.string());
+    int32_t keyCode = InputEventLookup::getKeyCodeByLabel(keyCodeToken.string());
     if (!keyCode) {
         ALOGE("%s: Expected key code label, got '%s'.", mTokenizer->getLocation().string(),
                 keyCodeToken.string());
@@ -1017,7 +1139,7 @@ status_t KeyCharacterMap::Parser::parseKeyProperty() {
             } else if (token == "fallback") {
                 mTokenizer->skipDelimiters(WHITESPACE);
                 token = mTokenizer->nextToken(WHITESPACE);
-                int32_t keyCode = getKeyCodeByLabel(token.string());
+                int32_t keyCode = InputEventLookup::getKeyCodeByLabel(token.string());
                 if (!keyCode) {
                     ALOGE("%s: Invalid key code label for fallback behavior, got '%s'.",
                             mTokenizer->getLocation().string(),
@@ -1034,7 +1156,7 @@ status_t KeyCharacterMap::Parser::parseKeyProperty() {
             } else if (token == "replace") {
                 mTokenizer->skipDelimiters(WHITESPACE);
                 token = mTokenizer->nextToken(WHITESPACE);
-                int32_t keyCode = getKeyCodeByLabel(token.string());
+                int32_t keyCode = InputEventLookup::getKeyCodeByLabel(token.string());
                 if (!keyCode) {
                     ALOGE("%s: Invalid key code label for replace, got '%s'.",
                             mTokenizer->getLocation().string(),

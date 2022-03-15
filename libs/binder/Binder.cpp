@@ -19,6 +19,7 @@
 #include <atomic>
 #include <set>
 
+#include <android-base/logging.h>
 #include <android-base/unique_fd.h>
 #include <binder/BpBinder.h>
 #include <binder/IInterface.h>
@@ -54,6 +55,8 @@ constexpr const bool kEnableRpcDevServers = true;
 constexpr const bool kEnableRpcDevServers = false;
 #endif
 
+// Log any reply transactions for which the data exceeds this size
+#define LOG_REPLIES_OVER_SIZE (300 * 1024)
 // ---------------------------------------------------------------------------
 
 IBinder::IBinder()
@@ -279,9 +282,11 @@ status_t BBinder::transact(
             err = pingBinder();
             break;
         case EXTENSION_TRANSACTION:
+            CHECK(reply != nullptr);
             err = reply->writeStrongBinder(getExtension());
             break;
         case DEBUG_PID_TRANSACTION:
+            CHECK(reply != nullptr);
             err = reply->writeInt32(getDebugPid());
             break;
         case SET_RPC_CLIENT_TRANSACTION: {
@@ -296,6 +301,10 @@ status_t BBinder::transact(
     // In case this is being transacted on in the same process.
     if (reply != nullptr) {
         reply->setDataPosition(0);
+        if (reply->dataSize() > LOG_REPLIES_OVER_SIZE) {
+            ALOGW("Large reply transaction of %zu bytes, interface descriptor %s, code %d",
+                  reply->dataSize(), String8(getInterfaceDescriptor()).c_str(), code);
+        }
     }
 
     return err;
@@ -547,7 +556,6 @@ status_t BBinder::setRpcClientDebug(android::base::unique_fd socketFd,
     AutoMutex _l(e->mLock);
     auto rpcServer = RpcServer::make();
     LOG_ALWAYS_FATAL_IF(rpcServer == nullptr, "RpcServer::make returns null");
-    rpcServer->iUnderstandThisCodeIsExperimentalAndIWillNotUseItInProduction();
     auto link = sp<RpcServerLink>::make(rpcServer, keepAliveBinder, weakThis);
     if (auto status = keepAliveBinder->linkToDeath(link, nullptr, 0); status != OK) {
         ALOGE("%s: keepAliveBinder->linkToDeath returns %s", __PRETTY_FUNCTION__,
@@ -585,6 +593,7 @@ status_t BBinder::onTransact(
 {
     switch (code) {
         case INTERFACE_TRANSACTION:
+            CHECK(reply != nullptr);
             reply->writeString16(getInterfaceDescriptor());
             return NO_ERROR;
 

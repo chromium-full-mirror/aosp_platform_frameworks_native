@@ -16,11 +16,13 @@ cc_test {
         "InputDevice_test.cpp",
         "InputEvent_test.cpp",
         "InputPublisherAndConsumer_test.cpp",
-        "InputWindow_test.cpp",
-        "LatencyStatistics_test.cpp",
         "TouchVideoFrame_test.cpp",
         "VelocityTracker_test.cpp",
         "VerifiedInputEvent_test.cpp",
+    ],
+    static_libs: [
+        "libgui_window_info_static",
+        "libinput",
     ],
     cflags: [
         "-Wall",
@@ -28,13 +30,15 @@ cc_test {
         "-Werror",
     ],
     shared_libs: [
-        "libinput",
-        "libcutils",
-        "libutils",
-        "libbinder",
-        "libui",
         "libbase",
-    ]
+        "libbinder",
+        "libcutils",
+        "liblog",
+        "libui",
+        "libutils",
+    ],
+    data: ["data/*.kcm"],
+    test_suites: ["device-tests"],
 }
 
 // NOTE: This is a compile time test, and does not need to be
@@ -43,8 +47,8 @@ cc_test {
 cc_library_static {
     name: "StructLayout_test",
     srcs: ["StructLayout_test.cpp"],
+    compile_multilib: "both",
     cflags: [
-        "-O0",
         "-Wall",
         "-Werror",
         "-Wextra",
@@ -56,5 +60,5 @@ cc_library_static {
         "libbinder",
         "libui",
         "libbase",
-    ]
+    ],
 }

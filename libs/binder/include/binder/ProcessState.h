@@ -91,8 +91,18 @@ public:
      */
     size_t getThreadPoolMaxThreadCount() const;
 
+    enum class DriverFeature {
+        ONEWAY_SPAM_DETECTION,
+    };
+    // Determine whether a feature is supported by the binder driver.
+    static bool isDriverFeatureEnabled(const DriverFeature feature);
+
 private:
     static sp<ProcessState> init(const char* defaultDriver, bool requireDefault);
+
+    static void onFork();
+    static void parentPostFork();
+    static void childPostFork();
 
     friend class IPCThreadState;
     friend class sp<ProcessState>;
@@ -132,6 +142,7 @@ private:
 
     Vector<handle_entry> mHandleToObject;
 
+    bool mForked;
     bool mThreadPoolStarted;
     volatile int32_t mThreadPoolSeq;
 

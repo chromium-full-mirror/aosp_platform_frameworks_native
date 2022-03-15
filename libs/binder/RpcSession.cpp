@@ -26,13 +26,14 @@
 
 #include <string_view>
 
+#include <android-base/hex.h>
 #include <android-base/macros.h>
-#include <android_runtime/vm.h>
+#include <android-base/scopeguard.h>
+#include <binder/BpBinder.h>
 #include <binder/Parcel.h>
 #include <binder/RpcServer.h>
 #include <binder/RpcTransportRaw.h>
 #include <binder/Stability.h>
-#include <jni.h>
 #include <utils/String8.h>
 
 #include "FdTrigger.h"
@@ -45,43 +46,65 @@
 extern "C" pid_t gettid();
 #endif
 
+#ifndef __ANDROID_RECOVERY__
+#include <android_runtime/vm.h>
+#include <jni.h>
+#endif
+
 namespace android {
 
 using base::unique_fd;
 
-RpcSession::RpcSession(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory)
-      : mRpcTransportCtxFactory(std::move(rpcTransportCtxFactory)) {
+RpcSession::RpcSession(std::unique_ptr<RpcTransportCtx> ctx) : mCtx(std::move(ctx)) {
     LOG_RPC_DETAIL("RpcSession created %p", this);
 
-    mState = std::make_unique<RpcState>();
+    mRpcBinderState = std::make_unique<RpcState>();
 }
 RpcSession::~RpcSession() {
     LOG_RPC_DETAIL("RpcSession destroyed %p", this);
 
     std::lock_guard<std::mutex> _l(mMutex);
-    LOG_ALWAYS_FATAL_IF(mIncomingConnections.size() != 0,
+    LOG_ALWAYS_FATAL_IF(mConnections.mIncoming.size() != 0,
                         "Should not be able to destroy a session with servers in use.");
 }
 
-sp<RpcSession> RpcSession::make(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory) {
+sp<RpcSession> RpcSession::make() {
     // Default is without TLS.
-    if (rpcTransportCtxFactory == nullptr)
-        rpcTransportCtxFactory = RpcTransportCtxFactoryRaw::make();
-    return sp<RpcSession>::make(std::move(rpcTransportCtxFactory));
+    return make(RpcTransportCtxFactoryRaw::make());
 }
 
-void RpcSession::setMaxThreads(size_t threads) {
-    std::lock_guard<std::mutex> _l(mMutex);
-    LOG_ALWAYS_FATAL_IF(!mOutgoingConnections.empty() || !mIncomingConnections.empty(),
-                        "Must set max threads before setting up connections, but has %zu client(s) "
-                        "and %zu server(s)",
-                        mOutgoingConnections.size(), mIncomingConnections.size());
-    mMaxThreads = threads;
+sp<RpcSession> RpcSession::make(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory) {
+    auto ctx = rpcTransportCtxFactory->newClientCtx();
+    if (ctx == nullptr) return nullptr;
+    return sp<RpcSession>::make(std::move(ctx));
 }
 
-size_t RpcSession::getMaxThreads() {
+void RpcSession::setMaxIncomingThreads(size_t threads) {
     std::lock_guard<std::mutex> _l(mMutex);
-    return mMaxThreads;
+    LOG_ALWAYS_FATAL_IF(!mConnections.mOutgoing.empty() || !mConnections.mIncoming.empty(),
+                        "Must set max incoming threads before setting up connections, but has %zu "
+                        "client(s) and %zu server(s)",
+                        mConnections.mOutgoing.size(), mConnections.mIncoming.size());
+    mMaxIncomingThreads = threads;
+}
+
+size_t RpcSession::getMaxIncomingThreads() {
+    std::lock_guard<std::mutex> _l(mMutex);
+    return mMaxIncomingThreads;
+}
+
+void RpcSession::setMaxOutgoingThreads(size_t threads) {
+    std::lock_guard<std::mutex> _l(mMutex);
+    LOG_ALWAYS_FATAL_IF(!mConnections.mOutgoing.empty() || !mConnections.mIncoming.empty(),
+                        "Must set max outgoing threads before setting up connections, but has %zu "
+                        "client(s) and %zu server(s)",
+                        mConnections.mOutgoing.size(), mConnections.mIncoming.size());
+    mMaxOutgoingThreads = threads;
+}
+
+size_t RpcSession::getMaxOutgoingThreads() {
+    std::lock_guard<std::mutex> _l(mMutex);
+    return mMaxOutgoingThreads;
 }
 
 bool RpcSession::setProtocolVersion(uint32_t version) {
@@ -129,8 +152,13 @@ status_t RpcSession::setupInetClient(const char* addr, unsigned int port) {
 }
 
 status_t RpcSession::setupPreconnectedClient(unique_fd fd, std::function<unique_fd()>&& request) {
-    return setupClient([&](const RpcAddress& sessionId, bool incoming) -> status_t {
-        // std::move'd from fd becomes -1 (!ok())
+    // Why passing raw fd? When fd is passed as reference, Clang analyzer sees that the variable
+    // `fd` is a moved-from object. To work-around the issue, unwrap the raw fd from the outer `fd`,
+    // pass the raw fd by value to the lambda, and then finally wrap it in unique_fd inside the
+    // lambda.
+    return setupClient([&, raw = fd.release()](const std::vector<uint8_t>& sessionId,
+                                               bool incoming) -> status_t {
+        unique_fd fd(raw);
         if (!fd.ok()) {
             fd = request();
             if (!fd.ok()) return BAD_VALUE;
@@ -155,12 +183,7 @@ status_t RpcSession::addNullDebuggingClient() {
         return -savedErrno;
     }
 
-    auto ctx = mRpcTransportCtxFactory->newClientCtx();
-    if (ctx == nullptr) {
-        ALOGE("Unable to create RpcTransportCtx for null debugging client");
-        return NO_MEMORY;
-    }
-    auto server = ctx->newTransport(std::move(serverFd), mShutdownTrigger.get());
+    auto server = mCtx->newTransport(std::move(serverFd), mShutdownTrigger.get());
     if (server == nullptr) {
         ALOGE("Unable to set up RpcTransport");
         return UNKNOWN_ERROR;
@@ -192,13 +215,13 @@ bool RpcSession::shutdownAndWait(bool wait) {
 
     if (wait) {
         LOG_ALWAYS_FATAL_IF(mShutdownListener == nullptr, "Shutdown listener not installed");
-        mShutdownListener->waitForShutdown(_l);
+        mShutdownListener->waitForShutdown(_l, sp<RpcSession>::fromExisting(this));
 
-        LOG_ALWAYS_FATAL_IF(!mThreads.empty(), "Shutdown failed");
+        LOG_ALWAYS_FATAL_IF(!mConnections.mThreads.empty(), "Shutdown failed");
     }
 
     _l.unlock();
-    mState->clear();
+    mRpcBinderState->clear();
 
     return true;
 }
@@ -216,12 +239,18 @@ status_t RpcSession::transact(const sp<IBinder>& binder, uint32_t code, const Pa
                              sp<RpcSession>::fromExisting(this), reply, flags);
 }
 
-status_t RpcSession::sendDecStrong(const RpcAddress& address) {
+status_t RpcSession::sendDecStrong(const BpBinder* binder) {
+    // target is 0 because this is used to free BpBinder objects
+    return sendDecStrongToTarget(binder->getPrivateAccessor().rpcAddress(), 0 /*target*/);
+}
+
+status_t RpcSession::sendDecStrongToTarget(uint64_t address, size_t target) {
     ExclusiveConnection connection;
     status_t status = ExclusiveConnection::find(sp<RpcSession>::fromExisting(this),
                                                 ConnectionUse::CLIENT_REFCOUNT, &connection);
     if (status != OK) return status;
-    return state()->sendDecStrong(connection.get(), sp<RpcSession>::fromExisting(this), address);
+    return state()->sendDecStrongToTarget(connection.get(), sp<RpcSession>::fromExisting(this),
+                                          address, target);
 }
 
 status_t RpcSession::readId() {
@@ -235,29 +264,30 @@ status_t RpcSession::readId() {
                                                 ConnectionUse::CLIENT, &connection);
     if (status != OK) return status;
 
-    mId = RpcAddress::zero();
-    status = state()->getSessionId(connection.get(), sp<RpcSession>::fromExisting(this),
-                                   &mId.value());
+    status = state()->getSessionId(connection.get(), sp<RpcSession>::fromExisting(this), &mId);
     if (status != OK) return status;
 
-    LOG_RPC_DETAIL("RpcSession %p has id %s", this, mId->toString().c_str());
+    LOG_RPC_DETAIL("RpcSession %p has id %s", this,
+                   base::HexString(mId.data(), mId.size()).c_str());
     return OK;
 }
 
 void RpcSession::WaitForShutdownListener::onSessionAllIncomingThreadsEnded(
         const sp<RpcSession>& session) {
     (void)session;
-    mShutdown = true;
 }
 
 void RpcSession::WaitForShutdownListener::onSessionIncomingThreadEnded() {
     mCv.notify_all();
 }
 
-void RpcSession::WaitForShutdownListener::waitForShutdown(std::unique_lock<std::mutex>& lock) {
-    while (!mShutdown) {
+void RpcSession::WaitForShutdownListener::waitForShutdown(std::unique_lock<std::mutex>& lock,
+                                                          const sp<RpcSession>& session) {
+    while (session->mConnections.mIncoming.size() > 0) {
         if (std::cv_status::timeout == mCv.wait_for(lock, std::chrono::seconds(1))) {
-            ALOGE("Waiting for RpcSession to shut down (1s w/o progress).");
+            ALOGE("Waiting for RpcSession to shut down (1s w/o progress): %zu incoming connections "
+                  "still.",
+                  session->mConnections.mIncoming.size());
         }
     }
 }
@@ -267,7 +297,7 @@ void RpcSession::preJoinThreadOwnership(std::thread thread) {
 
     {
         std::lock_guard<std::mutex> _l(mMutex);
-        mThreads[thread.get_id()] = std::move(thread);
+        mConnections.mThreads[thread.get_id()] = std::move(thread);
     }
 }
 
@@ -282,7 +312,8 @@ RpcSession::PreJoinSetupResult RpcSession::preJoinSetup(
     if (connection == nullptr) {
         status = DEAD_OBJECT;
     } else {
-        status = mState->readConnectionInit(connection, sp<RpcSession>::fromExisting(this));
+        status =
+                mRpcBinderState->readConnectionInit(connection, sp<RpcSession>::fromExisting(this));
     }
 
     return PreJoinSetupResult{
@@ -292,6 +323,9 @@ RpcSession::PreJoinSetupResult RpcSession::preJoinSetup(
 }
 
 namespace {
+#ifdef __ANDROID_RECOVERY__
+class JavaThreadAttacher {};
+#else
 // RAII object for attaching / detaching current thread to JVM if Android Runtime exists. If
 // Android Runtime doesn't exist, no-op.
 class JavaThreadAttacher {
@@ -344,6 +378,7 @@ private:
         return fn();
     }
 };
+#endif
 } // namespace
 
 void RpcSession::join(sp<RpcSession>&& session, PreJoinSetupResult&& setupResult) {
@@ -351,7 +386,7 @@ void RpcSession::join(sp<RpcSession>&& session, PreJoinSetupResult&& setupResult
 
     if (setupResult.status == OK) {
         LOG_ALWAYS_FATAL_IF(!connection, "must have connection if setup succeeded");
-        JavaThreadAttacher javaThreadAttacher;
+        [[maybe_unused]] JavaThreadAttacher javaThreadAttacher;
         while (true) {
             status_t status = session->state()->getAndExecuteCommand(connection, session,
                                                                      RpcState::CommandType::ANY);
@@ -369,10 +404,10 @@ void RpcSession::join(sp<RpcSession>&& session, PreJoinSetupResult&& setupResult
     sp<RpcSession::EventListener> listener;
     {
         std::lock_guard<std::mutex> _l(session->mMutex);
-        auto it = session->mThreads.find(std::this_thread::get_id());
-        LOG_ALWAYS_FATAL_IF(it == session->mThreads.end());
+        auto it = session->mConnections.mThreads.find(std::this_thread::get_id());
+        LOG_ALWAYS_FATAL_IF(it == session->mConnections.mThreads.end());
         it->second.detach();
-        session->mThreads.erase(it);
+        session->mConnections.mThreads.erase(it);
 
         listener = session->mEventListener.promote();
     }
@@ -399,18 +434,39 @@ sp<RpcServer> RpcSession::server() {
     return server;
 }
 
-status_t RpcSession::setupClient(
-        const std::function<status_t(const RpcAddress& sessionId, bool incoming)>& connectAndInit) {
+status_t RpcSession::setupClient(const std::function<status_t(const std::vector<uint8_t>& sessionId,
+                                                              bool incoming)>& connectAndInit) {
     {
         std::lock_guard<std::mutex> _l(mMutex);
-        LOG_ALWAYS_FATAL_IF(mOutgoingConnections.size() != 0,
+        LOG_ALWAYS_FATAL_IF(mConnections.mOutgoing.size() != 0,
                             "Must only setup session once, but already has %zu clients",
-                            mOutgoingConnections.size());
+                            mConnections.mOutgoing.size());
     }
+
     if (auto status = initShutdownTrigger(); status != OK) return status;
 
-    if (status_t status = connectAndInit(RpcAddress::zero(), false /*incoming*/); status != OK)
-        return status;
+    auto oldProtocolVersion = mProtocolVersion;
+    auto cleanup = base::ScopeGuard([&] {
+        // if any threads are started, shut them down
+        (void)shutdownAndWait(true);
+
+        mShutdownListener = nullptr;
+        mEventListener.clear();
+
+        mId.clear();
+
+        mShutdownTrigger = nullptr;
+        mRpcBinderState = std::make_unique<RpcState>();
+
+        // protocol version may have been downgraded - if we reuse this object
+        // to connect to another server, force that server to request a
+        // downgrade again
+        mProtocolVersion = oldProtocolVersion;
+
+        mConnections = {};
+    });
+
+    if (status_t status = connectAndInit({}, false /*incoming*/); status != OK) return status;
 
     {
         ExclusiveConnection connection;
@@ -443,6 +499,12 @@ status_t RpcSession::setupClient(
         return status;
     }
 
+    size_t outgoingThreads = std::min(numThreadsAvailable, mMaxOutgoingThreads);
+    ALOGI_IF(outgoingThreads != numThreadsAvailable,
+             "Server hints client to start %zu outgoing threads, but client will only start %zu "
+             "because it is preconfigured to start at most %zu outgoing threads.",
+             numThreadsAvailable, outgoingThreads, mMaxOutgoingThreads);
+
     // TODO(b/189955605): we should add additional sessions dynamically
     // instead of all at once - the other side should be responsible for setting
     // up additional connections. We need to create at least one (unless 0 are
@@ -450,27 +512,31 @@ status_t RpcSession::setupClient(
     // any requests at all.
 
     // we've already setup one client
-    for (size_t i = 0; i + 1 < numThreadsAvailable; i++) {
-        if (status_t status = connectAndInit(mId.value(), false /*incoming*/); status != OK)
-            return status;
+    LOG_RPC_DETAIL("RpcSession::setupClient() instantiating %zu outgoing (server max: %zu) and %zu "
+                   "incoming threads",
+                   outgoingThreads, numThreadsAvailable, mMaxIncomingThreads);
+    for (size_t i = 0; i + 1 < outgoingThreads; i++) {
+        if (status_t status = connectAndInit(mId, false /*incoming*/); status != OK) return status;
     }
 
-    for (size_t i = 0; i < mMaxThreads; i++) {
-        if (status_t status = connectAndInit(mId.value(), true /*incoming*/); status != OK)
-            return status;
+    for (size_t i = 0; i < mMaxIncomingThreads; i++) {
+        if (status_t status = connectAndInit(mId, true /*incoming*/); status != OK) return status;
     }
+
+    cleanup.Disable();
 
     return OK;
 }
 
 status_t RpcSession::setupSocketClient(const RpcSocketAddress& addr) {
-    return setupClient([&](const RpcAddress& sessionId, bool incoming) {
+    return setupClient([&](const std::vector<uint8_t>& sessionId, bool incoming) {
         return setupOneSocketConnection(addr, sessionId, incoming);
     });
 }
 
 status_t RpcSession::setupOneSocketConnection(const RpcSocketAddress& addr,
-                                              const RpcAddress& sessionId, bool incoming) {
+                                              const std::vector<uint8_t>& sessionId,
+                                              bool incoming) {
     for (size_t tries = 0; tries < 5; tries++) {
         if (tries > 0) usleep(10000);
 
@@ -484,37 +550,39 @@ status_t RpcSession::setupOneSocketConnection(const RpcSocketAddress& addr,
         }
 
         if (0 != TEMP_FAILURE_RETRY(connect(serverFd.get(), addr.addr(), addr.addrSize()))) {
-            if (errno == ECONNRESET) {
+            int connErrno = errno;
+            if (connErrno == EAGAIN || connErrno == EINPROGRESS) {
+                // For non-blocking sockets, connect() may return EAGAIN (for unix domain socket) or
+                // EINPROGRESS (for others). Call poll() and getsockopt() to get the error.
+                status_t pollStatus = mShutdownTrigger->triggerablePoll(serverFd, POLLOUT);
+                if (pollStatus != OK) {
+                    ALOGE("Could not POLLOUT after connect() on non-blocking socket: %s",
+                          statusToString(pollStatus).c_str());
+                    return pollStatus;
+                }
+                // Set connErrno to the errno that connect() would have set if the fd were blocking.
+                socklen_t connErrnoLen = sizeof(connErrno);
+                int ret =
+                        getsockopt(serverFd.get(), SOL_SOCKET, SO_ERROR, &connErrno, &connErrnoLen);
+                if (ret == -1) {
+                    int savedErrno = errno;
+                    ALOGE("Could not getsockopt() after connect() on non-blocking socket: %s. "
+                          "(Original error from connect() is: %s)",
+                          strerror(savedErrno), strerror(connErrno));
+                    return -savedErrno;
+                }
+                // Retrieved the real connErrno as if connect() was called with a blocking socket
+                // fd. Continue checking connErrno.
+            }
+            if (connErrno == ECONNRESET) {
                 ALOGW("Connection reset on %s", addr.toString().c_str());
                 continue;
             }
-            if (errno != EAGAIN && errno != EINPROGRESS) {
-                int savedErrno = errno;
+            // connErrno could be zero if getsockopt determines so. Hence zero-check again.
+            if (connErrno != 0) {
                 ALOGE("Could not connect socket at %s: %s", addr.toString().c_str(),
-                      strerror(savedErrno));
-                return -savedErrno;
-            }
-            // For non-blocking sockets, connect() may return EAGAIN (for unix domain socket) or
-            // EINPROGRESS (for others). Call poll() and getsockopt() to get the error.
-            status_t pollStatus = mShutdownTrigger->triggerablePoll(serverFd, POLLOUT);
-            if (pollStatus != OK) {
-                ALOGE("Could not POLLOUT after connect() on non-blocking socket: %s",
-                      statusToString(pollStatus).c_str());
-                return pollStatus;
-            }
-            int soError;
-            socklen_t soErrorLen = sizeof(soError);
-            int ret = getsockopt(serverFd.get(), SOL_SOCKET, SO_ERROR, &soError, &soErrorLen);
-            if (ret == -1) {
-                int savedErrno = errno;
-                ALOGE("Could not getsockopt() after connect() on non-blocking socket: %s",
-                      strerror(savedErrno));
-                return -savedErrno;
-            }
-            if (soError != 0) {
-                ALOGE("After connect(), getsockopt() returns error for socket at %s: %s",
-                      addr.toString().c_str(), strerror(soError));
-                return -soError;
+                      strerror(connErrno));
+                return -connErrno;
             }
         }
         LOG_RPC_DETAIL("Socket at %s client with fd %d", addr.toString().c_str(), serverFd.get());
@@ -526,37 +594,52 @@ status_t RpcSession::setupOneSocketConnection(const RpcSocketAddress& addr,
     return UNKNOWN_ERROR;
 }
 
-status_t RpcSession::initAndAddConnection(unique_fd fd, const RpcAddress& sessionId,
+status_t RpcSession::initAndAddConnection(unique_fd fd, const std::vector<uint8_t>& sessionId,
                                           bool incoming) {
     LOG_ALWAYS_FATAL_IF(mShutdownTrigger == nullptr);
-    auto ctx = mRpcTransportCtxFactory->newClientCtx();
-    if (ctx == nullptr) {
-        ALOGE("Unable to create client RpcTransportCtx with %s sockets",
-              mRpcTransportCtxFactory->toCString());
-        return NO_MEMORY;
-    }
-    auto server = ctx->newTransport(std::move(fd), mShutdownTrigger.get());
+    auto server = mCtx->newTransport(std::move(fd), mShutdownTrigger.get());
     if (server == nullptr) {
-        ALOGE("Unable to set up RpcTransport in %s context", mRpcTransportCtxFactory->toCString());
+        ALOGE("%s: Unable to set up RpcTransport", __PRETTY_FUNCTION__);
         return UNKNOWN_ERROR;
     }
 
     LOG_RPC_DETAIL("Socket at client with RpcTransport %p", server.get());
 
+    if (sessionId.size() > std::numeric_limits<uint16_t>::max()) {
+        ALOGE("Session ID too big %zu", sessionId.size());
+        return BAD_VALUE;
+    }
+
     RpcConnectionHeader header{
             .version = mProtocolVersion.value_or(RPC_WIRE_PROTOCOL_VERSION),
             .options = 0,
+            .sessionIdSize = static_cast<uint16_t>(sessionId.size()),
     };
-    memcpy(&header.sessionId, &sessionId.viewRawEmbedded(), sizeof(RpcWireAddress));
 
-    if (incoming) header.options |= RPC_CONNECTION_OPTION_INCOMING;
+    if (incoming) {
+        header.options |= RPC_CONNECTION_OPTION_INCOMING;
+    }
 
+    iovec headerIov{&header, sizeof(header)};
     auto sendHeaderStatus =
-            server->interruptableWriteFully(mShutdownTrigger.get(), &header, sizeof(header));
+            server->interruptableWriteFully(mShutdownTrigger.get(), &headerIov, 1, {});
     if (sendHeaderStatus != OK) {
         ALOGE("Could not write connection header to socket: %s",
               statusToString(sendHeaderStatus).c_str());
         return sendHeaderStatus;
+    }
+
+    if (sessionId.size() > 0) {
+        iovec sessionIov{const_cast<void*>(static_cast<const void*>(sessionId.data())),
+                         sessionId.size()};
+        auto sendSessionIdStatus =
+                server->interruptableWriteFully(mShutdownTrigger.get(), &sessionIov, 1, {});
+        if (sendSessionIdStatus != OK) {
+            ALOGE("Could not write session ID ('%s') to socket: %s",
+                  base::HexString(sessionId.data(), sessionId.size()).c_str(),
+                  statusToString(sendSessionIdStatus).c_str());
+            return sendSessionIdStatus;
+        }
     }
 
     LOG_RPC_DETAIL("Socket at client: header sent");
@@ -614,12 +697,13 @@ status_t RpcSession::addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTran
         std::lock_guard<std::mutex> _l(mMutex);
         connection->rpcTransport = std::move(rpcTransport);
         connection->exclusiveTid = gettid();
-        mOutgoingConnections.push_back(connection);
+        mConnections.mOutgoing.push_back(connection);
     }
 
     status_t status = OK;
     if (init) {
-        mState->sendConnectionInit(connection, sp<RpcSession>::fromExisting(this));
+        status =
+                mRpcBinderState->sendConnectionInit(connection, sp<RpcSession>::fromExisting(this));
     }
 
     {
@@ -631,7 +715,8 @@ status_t RpcSession::addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTran
 }
 
 bool RpcSession::setForServer(const wp<RpcServer>& server, const wp<EventListener>& eventListener,
-                              const RpcAddress& sessionId) {
+                              const std::vector<uint8_t>& sessionId,
+                              const sp<IBinder>& sessionSpecificRoot) {
     LOG_ALWAYS_FATAL_IF(mForServer != nullptr);
     LOG_ALWAYS_FATAL_IF(server == nullptr);
     LOG_ALWAYS_FATAL_IF(mEventListener != nullptr);
@@ -644,6 +729,7 @@ bool RpcSession::setForServer(const wp<RpcServer>& server, const wp<EventListene
     mId = sessionId;
     mForServer = server;
     mEventListener = eventListener;
+    mSessionSpecificRootObject = sessionSpecificRoot;
     return true;
 }
 
@@ -651,9 +737,9 @@ sp<RpcSession::RpcConnection> RpcSession::assignIncomingConnectionToThisThread(
         std::unique_ptr<RpcTransport> rpcTransport) {
     std::lock_guard<std::mutex> _l(mMutex);
 
-    if (mIncomingConnections.size() >= mMaxThreads) {
+    if (mConnections.mIncoming.size() >= mMaxIncomingThreads) {
         ALOGE("Cannot add thread to session with %zu threads (max is set to %zu)",
-              mIncomingConnections.size(), mMaxThreads);
+              mConnections.mIncoming.size(), mMaxIncomingThreads);
         return nullptr;
     }
 
@@ -661,7 +747,7 @@ sp<RpcSession::RpcConnection> RpcSession::assignIncomingConnectionToThisThread(
     // happens when new connections are still being established as part of a
     // very short-lived session which shuts down after it already started
     // accepting new connections.
-    if (mIncomingConnections.size() < mMaxIncomingConnections) {
+    if (mConnections.mIncoming.size() < mConnections.mMaxIncoming) {
         return nullptr;
     }
 
@@ -669,18 +755,19 @@ sp<RpcSession::RpcConnection> RpcSession::assignIncomingConnectionToThisThread(
     session->rpcTransport = std::move(rpcTransport);
     session->exclusiveTid = gettid();
 
-    mIncomingConnections.push_back(session);
-    mMaxIncomingConnections = mIncomingConnections.size();
+    mConnections.mIncoming.push_back(session);
+    mConnections.mMaxIncoming = mConnections.mIncoming.size();
 
     return session;
 }
 
 bool RpcSession::removeIncomingConnection(const sp<RpcConnection>& connection) {
     std::unique_lock<std::mutex> _l(mMutex);
-    if (auto it = std::find(mIncomingConnections.begin(), mIncomingConnections.end(), connection);
-        it != mIncomingConnections.end()) {
-        mIncomingConnections.erase(it);
-        if (mIncomingConnections.size() == 0) {
+    if (auto it =
+                std::find(mConnections.mIncoming.begin(), mConnections.mIncoming.end(), connection);
+        it != mConnections.mIncoming.end()) {
+        mConnections.mIncoming.erase(it);
+        if (mConnections.mIncoming.size() == 0) {
             sp<EventListener> listener = mEventListener.promote();
             if (listener) {
                 _l.unlock();
@@ -692,6 +779,10 @@ bool RpcSession::removeIncomingConnection(const sp<RpcConnection>& connection) {
     return false;
 }
 
+std::vector<uint8_t> RpcSession::getCertificate(RpcCertificateFormat format) {
+    return mCtx->getCertificate(format);
+}
+
 status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, ConnectionUse use,
                                                ExclusiveConnection* connection) {
     connection->mSession = session;
@@ -701,7 +792,7 @@ status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, Co
     pid_t tid = gettid();
     std::unique_lock<std::mutex> _l(session->mMutex);
 
-    session->mWaitingThreads++;
+    session->mConnections.mWaitingThreads++;
     while (true) {
         sp<RpcConnection> exclusive;
         sp<RpcConnection> available;
@@ -709,11 +800,11 @@ status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, Co
         // CHECK FOR DEDICATED CLIENT SOCKET
         //
         // A server/looper should always use a dedicated connection if available
-        findConnection(tid, &exclusive, &available, session->mOutgoingConnections,
-                       session->mOutgoingConnectionsOffset);
+        findConnection(tid, &exclusive, &available, session->mConnections.mOutgoing,
+                       session->mConnections.mOutgoingOffset);
 
         // WARNING: this assumes a server cannot request its client to send
-        // a transaction, as mIncomingConnections is excluded below.
+        // a transaction, as mIncoming is excluded below.
         //
         // Imagine we have more than one thread in play, and a single thread
         // sends a synchronous, then an asynchronous command. Imagine the
@@ -723,8 +814,8 @@ status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, Co
         // command. So, we move to considering the second available thread
         // for subsequent calls.
         if (use == ConnectionUse::CLIENT_ASYNC && (exclusive != nullptr || available != nullptr)) {
-            session->mOutgoingConnectionsOffset = (session->mOutgoingConnectionsOffset + 1) %
-                    session->mOutgoingConnections.size();
+            session->mConnections.mOutgoingOffset = (session->mConnections.mOutgoingOffset + 1) %
+                    session->mConnections.mOutgoing.size();
         }
 
         // USE SERVING SOCKET (e.g. nested transaction)
@@ -732,7 +823,7 @@ status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, Co
             sp<RpcConnection> exclusiveIncoming;
             // server connections are always assigned to a thread
             findConnection(tid, &exclusiveIncoming, nullptr /*available*/,
-                           session->mIncomingConnections, 0 /* index hint */);
+                           session->mConnections.mIncoming, 0 /* index hint */);
 
             // asynchronous calls cannot be nested, we currently allow ref count
             // calls to be nested (so that you can use this without having extra
@@ -761,19 +852,26 @@ status_t RpcSession::ExclusiveConnection::find(const sp<RpcSession>& session, Co
             break;
         }
 
-        if (session->mOutgoingConnections.size() == 0) {
-            ALOGE("Session has no client connections. This is required for an RPC server to make "
-                  "any non-nested (e.g. oneway or on another thread) calls. Use: %d. Server "
-                  "connections: %zu",
-                  static_cast<int>(use), session->mIncomingConnections.size());
+        if (session->mConnections.mOutgoing.size() == 0) {
+            ALOGE("Session has no outgoing connections. This is required for an RPC server to make "
+                  "any non-nested (e.g. oneway or on another thread) calls. Use code request "
+                  "reason: %d. Incoming connections: %zu. %s.",
+                  static_cast<int>(use), session->mConnections.mIncoming.size(),
+                  (session->server()
+                           ? "This is a server session, so see RpcSession::setMaxIncomingThreads "
+                             "for the corresponding client"
+                           : "This is a client session, so see RpcSession::setMaxOutgoingThreads "
+                             "for this client or RpcServer::setMaxThreads for the corresponding "
+                             "server"));
             return WOULD_BLOCK;
         }
 
         LOG_RPC_DETAIL("No available connections (have %zu clients and %zu servers). Waiting...",
-                       session->mOutgoingConnections.size(), session->mIncomingConnections.size());
+                       session->mConnections.mOutgoing.size(),
+                       session->mConnections.mIncoming.size());
         session->mAvailableConnectionCv.wait(_l);
     }
-    session->mWaitingThreads--;
+    session->mConnections.mWaitingThreads--;
 
     return OK;
 }
@@ -812,7 +910,7 @@ RpcSession::ExclusiveConnection::~ExclusiveConnection() {
     if (!mReentrant && mConnection != nullptr) {
         std::unique_lock<std::mutex> _l(mSession->mMutex);
         mConnection->exclusiveTid = std::nullopt;
-        if (mSession->mWaitingThreads > 0) {
+        if (mSession->mConnections.mWaitingThreads > 0) {
             _l.unlock();
             mSession->mAvailableConnectionCv.notify_one();
         }

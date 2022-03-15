@@ -17,7 +17,6 @@
 
 #include <android-base/unique_fd.h>
 #include <binder/IBinder.h>
-#include <binder/RpcAddress.h>
 #include <binder/RpcTransport.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
@@ -26,10 +25,6 @@
 #include <optional>
 #include <thread>
 #include <vector>
-
-// WARNING: This is a feature which is still in development, and it is subject
-// to radical change. Any production use of this may subject your code to any
-// number of problems.
 
 namespace android {
 
@@ -51,11 +46,18 @@ constexpr uint32_t RPC_WIRE_PROTOCOL_VERSION = RPC_WIRE_PROTOCOL_VERSION_EXPERIM
  */
 class RpcSession final : public virtual RefBase {
 public:
-    static sp<RpcSession> make(
-            std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory = nullptr);
+    static constexpr size_t kDefaultMaxOutgoingThreads = 10;
+
+    // Create an RpcSession with default configuration (raw sockets).
+    static sp<RpcSession> make();
+
+    // Create an RpcSession with the given configuration. |serverRpcCertificateFormat| and
+    // |serverCertificate| must have values or be nullopt simultaneously. If they have values, set
+    // server certificate.
+    static sp<RpcSession> make(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory);
 
     /**
-     * Set the maximum number of threads allowed to be made (for things like callbacks).
+     * Set the maximum number of incoming threads allowed to be made (for things like callbacks).
      * By default, this is 0. This must be called before setting up this connection as a client.
      * Server sessions will inherits this value from RpcServer.
      *
@@ -64,8 +66,20 @@ public:
      *
      * TODO(b/189955605): start these dynamically
      */
-    void setMaxThreads(size_t threads);
-    size_t getMaxThreads();
+    void setMaxIncomingThreads(size_t threads);
+    size_t getMaxIncomingThreads();
+
+    /**
+     * Set the maximum number of outgoing threads allowed to be made.
+     * By default, this is |kDefaultMaxOutgoingThreads|. This must be called before setting up this
+     * connection as a client.
+     *
+     * This limits the number of outgoing threads on top of the remote peer setting. This RpcSession
+     * will only instantiate |min(maxOutgoingThreads, remoteMaxThreads)| outgoing threads, where
+     * |remoteMaxThreads| can be retrieved from the remote peer via |getRemoteMaxThreads()|.
+     */
+    void setMaxOutgoingThreads(size_t threads);
+    size_t getMaxOutgoingThreads();
 
     /**
      * By default, the minimum of the supported versions of the client and the
@@ -122,7 +136,12 @@ public:
      * Query the other side of the session for the maximum number of threads
      * it supports (maximum number of concurrent non-nested synchronous transactions)
      */
-    status_t getRemoteMaxThreads(size_t* maxThreads);
+    [[nodiscard]] status_t getRemoteMaxThreads(size_t* maxThreads);
+
+    /**
+     * See RpcTransportCtx::getCertificate
+     */
+    std::vector<uint8_t> getCertificate(RpcCertificateFormat);
 
     /**
      * Shuts down the service.
@@ -142,7 +161,13 @@ public:
 
     [[nodiscard]] status_t transact(const sp<IBinder>& binder, uint32_t code, const Parcel& data,
                                     Parcel* reply, uint32_t flags);
-    [[nodiscard]] status_t sendDecStrong(const RpcAddress& address);
+
+    /**
+     * Generally, you should not call this, unless you are testing error
+     * conditions, as this is called automatically by BpBinders when they are
+     * deleted (this is also why a raw pointer is used here)
+     */
+    [[nodiscard]] status_t sendDecStrong(const BpBinder* binder);
 
     ~RpcSession();
 
@@ -153,13 +178,16 @@ public:
     sp<RpcServer> server();
 
     // internal only
-    const std::unique_ptr<RpcState>& state() { return mState; }
+    const std::unique_ptr<RpcState>& state() { return mRpcBinderState; }
 
 private:
     friend sp<RpcSession>;
     friend RpcServer;
     friend RpcState;
-    explicit RpcSession(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory);
+    explicit RpcSession(std::unique_ptr<RpcTransportCtx> ctx);
+
+    // for 'target', see RpcState::sendDecStrongToTarget
+    [[nodiscard]] status_t sendDecStrongToTarget(uint64_t address, size_t target);
 
     class EventListener : public virtual RefBase {
     public:
@@ -171,12 +199,12 @@ private:
     public:
         void onSessionAllIncomingThreadsEnded(const sp<RpcSession>& session) override;
         void onSessionIncomingThreadEnded() override;
-        void waitForShutdown(std::unique_lock<std::mutex>& lock);
+        void waitForShutdown(std::unique_lock<std::mutex>& lock, const sp<RpcSession>& session);
 
     private:
         std::condition_variable mCv;
-        volatile bool mShutdown = false;
     };
+    friend WaitForShutdownListener;
 
     struct RpcConnection : public RefBase {
         std::unique_ptr<RpcTransport> rpcTransport;
@@ -188,7 +216,7 @@ private:
         bool allowNested = false;
     };
 
-    status_t readId();
+    [[nodiscard]] status_t readId();
 
     // A thread joining a server must always call these functions in order, and
     // cleanup is only programmed once into join. These are in separate
@@ -210,24 +238,27 @@ private:
     static void join(sp<RpcSession>&& session, PreJoinSetupResult&& result);
 
     [[nodiscard]] status_t setupClient(
-            const std::function<status_t(const RpcAddress& sessionId, bool incoming)>&
+            const std::function<status_t(const std::vector<uint8_t>& sessionId, bool incoming)>&
                     connectAndInit);
     [[nodiscard]] status_t setupSocketClient(const RpcSocketAddress& address);
     [[nodiscard]] status_t setupOneSocketConnection(const RpcSocketAddress& address,
-                                                    const RpcAddress& sessionId, bool incoming);
-    [[nodiscard]] status_t initAndAddConnection(base::unique_fd fd, const RpcAddress& sessionId,
+                                                    const std::vector<uint8_t>& sessionId,
+                                                    bool incoming);
+    [[nodiscard]] status_t initAndAddConnection(base::unique_fd fd,
+                                                const std::vector<uint8_t>& sessionId,
                                                 bool incoming);
     [[nodiscard]] status_t addIncomingConnection(std::unique_ptr<RpcTransport> rpcTransport);
     [[nodiscard]] status_t addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTransport,
                                                  bool init);
     [[nodiscard]] bool setForServer(const wp<RpcServer>& server,
                                     const wp<RpcSession::EventListener>& eventListener,
-                                    const RpcAddress& sessionId);
+                                    const std::vector<uint8_t>& sessionId,
+                                    const sp<IBinder>& sessionSpecificRoot);
     sp<RpcConnection> assignIncomingConnectionToThisThread(
             std::unique_ptr<RpcTransport> rpcTransport);
     [[nodiscard]] bool removeIncomingConnection(const sp<RpcConnection>& connection);
 
-    status_t initShutdownTrigger();
+    [[nodiscard]] status_t initShutdownTrigger();
 
     enum class ConnectionUse {
         CLIENT,
@@ -238,8 +269,8 @@ private:
     // Object representing exclusive access to a connection.
     class ExclusiveConnection {
     public:
-        static status_t find(const sp<RpcSession>& session, ConnectionUse use,
-                             ExclusiveConnection* connection);
+        [[nodiscard]] static status_t find(const sp<RpcSession>& session, ConnectionUse use,
+                                           ExclusiveConnection* connection);
 
         ~ExclusiveConnection();
         const sp<RpcConnection>& get() { return mConnection; }
@@ -259,15 +290,15 @@ private:
         bool mReentrant = false;
     };
 
-    const std::unique_ptr<RpcTransportCtxFactory> mRpcTransportCtxFactory;
+    const std::unique_ptr<RpcTransportCtx> mCtx;
 
-    // On the other side of a session, for each of mOutgoingConnections here, there should
-    // be one of mIncomingConnections on the other side (and vice versa).
+    // On the other side of a session, for each of mOutgoing here, there should
+    // be one of mIncoming on the other side (and vice versa).
     //
     // For the simplest session, a single server with one client, you would
     // have:
-    //  - the server has a single 'mIncomingConnections' and a thread listening on this
-    //  - the client has a single 'mOutgoingConnections' and makes calls to this
+    //  - the server has a single 'mIncoming' and a thread listening on this
+    //  - the client has a single 'mOutgoing' and makes calls to this
     //  - here, when the client makes a call, the server can call back into it
     //    (nested calls), but outside of this, the client will only ever read
     //    calls from the server when it makes a call itself.
@@ -279,25 +310,33 @@ private:
     sp<WaitForShutdownListener> mShutdownListener; // used for client sessions
     wp<EventListener> mEventListener; // mForServer if server, mShutdownListener if client
 
-    std::optional<RpcAddress> mId;
+    // session-specific root object (if a different root is used for each
+    // session)
+    sp<IBinder> mSessionSpecificRootObject;
+
+    std::vector<uint8_t> mId;
 
     std::unique_ptr<FdTrigger> mShutdownTrigger;
 
-    std::unique_ptr<RpcState> mState;
+    std::unique_ptr<RpcState> mRpcBinderState;
 
     std::mutex mMutex; // for all below
 
-    size_t mMaxThreads = 0;
+    size_t mMaxIncomingThreads = 0;
+    size_t mMaxOutgoingThreads = kDefaultMaxOutgoingThreads;
     std::optional<uint32_t> mProtocolVersion;
 
     std::condition_variable mAvailableConnectionCv; // for mWaitingThreads
-    size_t mWaitingThreads = 0;
-    // hint index into clients, ++ when sending an async transaction
-    size_t mOutgoingConnectionsOffset = 0;
-    std::vector<sp<RpcConnection>> mOutgoingConnections;
-    size_t mMaxIncomingConnections = 0;
-    std::vector<sp<RpcConnection>> mIncomingConnections;
-    std::map<std::thread::id, std::thread> mThreads;
+
+    struct ThreadState {
+        size_t mWaitingThreads = 0;
+        // hint index into clients, ++ when sending an async transaction
+        size_t mOutgoingOffset = 0;
+        std::vector<sp<RpcConnection>> mOutgoing;
+        size_t mMaxIncoming = 0;
+        std::vector<sp<RpcConnection>> mIncoming;
+        std::map<std::thread::id, std::thread> mThreads;
+    } mConnections;
 };
 
 } // namespace android

@@ -17,7 +17,6 @@
 
 #include <android-base/unique_fd.h>
 #include <binder/IBinder.h>
-#include <binder/RpcAddress.h>
 #include <binder/RpcSession.h>
 #include <binder/RpcTransport.h>
 #include <utils/Errors.h>
@@ -25,10 +24,6 @@
 
 #include <mutex>
 #include <thread>
-
-// WARNING: This is a feature which is still in development, and it is subject
-// to radical change. Any production use of this may subject your code to any
-// number of problems.
 
 namespace android {
 
@@ -100,8 +95,6 @@ public:
      */
     [[nodiscard]] status_t setupExternalServer(base::unique_fd serverFd);
 
-    void iUnderstandThisCodeIsExperimentalAndIWillNotUseItInProduction();
-
     /**
      * This must be called before adding a client session.
      *
@@ -131,7 +124,16 @@ public:
      * Holds a weak reference to the root object.
      */
     void setRootObjectWeak(const wp<IBinder>& binder);
+    /**
+     * Allows a root object to be created for each session
+     */
+    void setPerSessionRootObject(std::function<sp<IBinder>(const sockaddr*, socklen_t)>&& object);
     sp<IBinder> getRootObject();
+
+    /**
+     * See RpcTransportCtx::getCertificate
+     */
+    std::vector<uint8_t> getCertificate(RpcCertificateFormat);
 
     /**
      * Runs join() in a background thread. Immediately returns.
@@ -170,16 +172,16 @@ public:
 
 private:
     friend sp<RpcServer>;
-    explicit RpcServer(std::unique_ptr<RpcTransportCtxFactory> rpcTransportCtxFactory);
+    explicit RpcServer(std::unique_ptr<RpcTransportCtx> ctx);
 
     void onSessionAllIncomingThreadsEnded(const sp<RpcSession>& session) override;
     void onSessionIncomingThreadEnded() override;
 
-    static void establishConnection(sp<RpcServer>&& server, base::unique_fd clientFd);
-    status_t setupSocketServer(const RpcSocketAddress& address);
+    static void establishConnection(sp<RpcServer>&& server, base::unique_fd clientFd,
+                                    const sockaddr_storage addr, socklen_t addrLen);
+    [[nodiscard]] status_t setupSocketServer(const RpcSocketAddress& address);
 
-    const std::unique_ptr<RpcTransportCtxFactory> mRpcTransportCtxFactory;
-    bool mAgreedExperimental = false;
+    const std::unique_ptr<RpcTransportCtx> mCtx;
     size_t mMaxThreads = 1;
     std::optional<uint32_t> mProtocolVersion;
     base::unique_fd mServer; // socket we are accepting sessions on
@@ -190,10 +192,10 @@ private:
     std::map<std::thread::id, std::thread> mConnectingThreads;
     sp<IBinder> mRootObject;
     wp<IBinder> mRootObjectWeak;
-    std::map<RpcAddress, sp<RpcSession>> mSessions;
+    std::function<sp<IBinder>(const sockaddr*, socklen_t)> mRootObjectFactory;
+    std::map<std::vector<uint8_t>, sp<RpcSession>> mSessions;
     std::unique_ptr<FdTrigger> mShutdownTrigger;
     std::condition_variable mShutdownCv;
-    std::unique_ptr<RpcTransportCtx> mCtx;
 };
 
 } // namespace android

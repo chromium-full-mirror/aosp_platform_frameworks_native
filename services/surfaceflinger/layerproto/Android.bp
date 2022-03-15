@@ -7,14 +7,13 @@ package {
     default_applicable_licenses: ["frameworks_native_license"],
 }
 
-cc_library_shared {
+cc_library {
     name: "liblayers_proto",
     export_include_dirs: ["include"],
 
     srcs: [
         "LayerProtoParser.cpp",
-        "layers.proto",
-        "layerstrace.proto",
+        "*.proto",
     ],
 
     shared_libs: [
@@ -42,7 +41,6 @@ cc_library_shared {
         "-Wno-old-style-cast",
         "-Wno-undef",
     ],
-
 }
 
 java_library_static {
